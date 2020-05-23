@@ -736,7 +736,7 @@ impl<'a, 'b> ModuleTyper<'a, 'b> {
                 for (parameter, (location, argument)) in
                     parameter_types.iter().zip(argument_types.iter())
                 {
-                    unify(parameter.clone(), argument.clone(), self)
+                    unify(parameter.clone(), argument.clone())
                         .map_err(|e| convert_unify_error(e, &location))?;
                 }
 
@@ -780,1180 +780,6 @@ impl<'a, 'b> ModuleTyper<'a, 'b> {
 
     pub fn insert_accessors(&mut self, type_name: &str, accessors: AccessorsMap) {
         self.accessors.insert(type_name.to_string(), accessors);
-    }
-
-    /// Crawl the AST, annotating each node with the inferred type or
-    /// returning an error.
-    ///
-    pub fn infer(&mut self, expr: UntypedExpr, level: usize) -> Result<TypedExpr, Error> {
-        match expr {
-            UntypedExpr::ListNil { location, .. } => self.infer_nil(location, level),
-
-            UntypedExpr::Todo { location, .. } => self.infer_todo(location, level),
-
-            UntypedExpr::Var { location, name, .. } => self.infer_var(name, location, level),
-
-            UntypedExpr::Int {
-                location, value, ..
-            } => self.infer_int(value, location),
-
-            UntypedExpr::Seq { first, then, .. } => self.infer_seq(*first, *then, level),
-
-            UntypedExpr::Tuple {
-                location, elems, ..
-            } => self.infer_tuple(elems, location, level),
-
-            UntypedExpr::Float {
-                location, value, ..
-            } => self.infer_float(value, location),
-
-            UntypedExpr::String {
-                location, value, ..
-            } => self.infer_string(value, location),
-
-            UntypedExpr::Pipe {
-                left,
-                right,
-                location,
-            } => self.infer_pipe(*left, *right, location, level),
-
-            UntypedExpr::Fn {
-                location,
-                is_capture,
-                args,
-                body,
-                return_annotation,
-                ..
-            } => self.infer_fn(args, *body, is_capture, return_annotation, level, location),
-
-            UntypedExpr::Let {
-                location,
-                pattern,
-                value,
-                then,
-                kind,
-                annotation,
-                ..
-            } => self.infer_let(pattern, *value, *then, kind, &annotation, level, location),
-
-            UntypedExpr::Case {
-                location,
-                subjects,
-                clauses,
-                ..
-            } => self.infer_case(subjects, clauses, level, location),
-
-            UntypedExpr::ListCons {
-                location,
-                head,
-                tail,
-                deprecated_syntax,
-                ..
-            } => self.infer_cons(*head, *tail, deprecated_syntax, location, level),
-
-            UntypedExpr::Call {
-                location,
-                fun,
-                args,
-                ..
-            } => self.infer_call(*fun, args, level, location),
-
-            UntypedExpr::BinOp {
-                location,
-                name,
-                left,
-                right,
-                ..
-            } => self.infer_binop(name, *left, *right, level, location),
-
-            UntypedExpr::FieldAccess {
-                location,
-                label,
-                container,
-                ..
-            } => self.infer_field_access(*container, label, location, level),
-
-            UntypedExpr::TupleIndex {
-                location,
-                index,
-                tuple,
-                ..
-            } => self.infer_tuple_index(*tuple, index, location, level),
-        }
-    }
-    fn infer_var(
-        &mut self,
-        name: String,
-        location: SrcSpan,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        let constructor = self.infer_value_constructor(&name, level, &location)?;
-        Ok(TypedExpr::Var {
-            constructor,
-            location,
-            name,
-        })
-    }
-
-    fn infer_field_access(
-        &mut self,
-        container: UntypedExpr,
-        label: String,
-        access_location: SrcSpan,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        match container {
-            UntypedExpr::Var { name, location, .. } if !self.local_values.contains_key(&name) => {
-                self.infer_module_access(name.as_ref(), label, level, &location, access_location)
-            }
-
-            _ => self.infer_record_access(container, label, level, access_location),
-        }
-    }
-
-    fn infer_pipe(
-        &mut self,
-        left: UntypedExpr,
-        right: UntypedExpr,
-        location: SrcSpan,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        match right {
-            // left |> right(..args)
-            UntypedExpr::Call { fun, args, .. } => {
-                let fun = self.infer(*fun, level)?;
-                match fun.typ().fn_arity() {
-                    // Rewrite as right(left, ..args)
-                    Some(arity) if arity == args.len() + 1 => {
-                        self.infer_insert_pipe(fun, args, left, level)
-                    }
-
-                    // Rewrite as right(..args)(left)
-                    _ => self.infer_apply_to_call_pipe(fun, args, left, location, level),
-                }
-            }
-
-            // right(left)
-            right => self.infer_apply_pipe(left, right, location, level),
-        }
-    }
-
-    /// Attempt to infer a |> b(..c) as b(..c)(a)
-    fn infer_apply_to_call_pipe(
-        &mut self,
-        fun: TypedExpr,
-        args: Vec<CallArg<UntypedExpr>>,
-        left: UntypedExpr,
-        location: SrcSpan,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        let right_location = left.location().clone();
-        let (fun, args, typ) =
-            self.do_infer_call_with_known_fun(fun, args, level, &right_location)?;
-        let fun = TypedExpr::Call {
-            location: right_location,
-            typ,
-            args,
-            fun: Box::new(fun),
-        };
-        let args = vec![CallArg {
-            label: None,
-            location: left.location().clone(),
-            value: left,
-        }];
-        let (fun, args, typ) = self.do_infer_call_with_known_fun(fun, args, level, &location)?;
-        Ok(TypedExpr::Call {
-            location,
-            typ,
-            args,
-            fun: Box::new(fun),
-        })
-    }
-
-    /// Attempt to infer a |> b(c) as b(a, c)
-    fn infer_insert_pipe(
-        &mut self,
-        fun: TypedExpr,
-        args: Vec<CallArg<UntypedExpr>>,
-        left: UntypedExpr,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        let location = left.location().clone();
-        let mut new_args = Vec::with_capacity(args.len() + 1);
-        new_args.push(CallArg {
-            label: None,
-            location: left.location().clone(),
-            value: left,
-        });
-        for arg in args {
-            new_args.push(arg.clone());
-        }
-        let (fun, args, typ) =
-            self.do_infer_call_with_known_fun(fun, new_args, level, &location)?;
-        Ok(TypedExpr::Call {
-            location,
-            typ,
-            args,
-            fun: Box::new(fun),
-        })
-    }
-
-    /// Attempt to infer a |> b as b(a)
-    fn infer_apply_pipe(
-        &mut self,
-        left: UntypedExpr,
-        right: UntypedExpr,
-        location: SrcSpan,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        let left = Box::new(self.infer(left, level)?);
-        let right = Box::new(self.infer(right, level)?);
-        let typ = self.new_unbound_var(level);
-        let fn_typ = Arc::new(Type::Fn {
-            args: vec![left.typ()],
-            retrn: typ.clone(),
-        });
-        unify(right.typ(), fn_typ, self).map_err(|e| convert_unify_error(e, &location))?;
-
-        Ok(TypedExpr::Pipe {
-            location,
-            typ,
-            right,
-            left,
-        })
-    }
-
-    fn infer_nil(&mut self, location: SrcSpan, level: usize) -> Result<TypedExpr, Error> {
-        Ok(TypedExpr::ListNil {
-            location,
-            typ: list(self.new_unbound_var(level)),
-        })
-    }
-
-    fn infer_todo(&mut self, location: SrcSpan, level: usize) -> Result<TypedExpr, Error> {
-        self.warnings.push(Warning::Todo {
-            location: location.clone(),
-        });
-
-        Ok(TypedExpr::Todo {
-            location,
-            typ: self.new_unbound_var(level),
-        })
-    }
-
-    fn infer_string(&mut self, value: String, location: SrcSpan) -> Result<TypedExpr, Error> {
-        Ok(TypedExpr::String {
-            location,
-            value,
-            typ: string(),
-        })
-    }
-
-    fn infer_int(&mut self, value: String, location: SrcSpan) -> Result<TypedExpr, Error> {
-        Ok(TypedExpr::Int {
-            location,
-            value,
-            typ: int(),
-        })
-    }
-
-    fn infer_float(&mut self, value: String, location: SrcSpan) -> Result<TypedExpr, Error> {
-        Ok(TypedExpr::Float {
-            location,
-            value,
-            typ: float(),
-        })
-    }
-
-    fn infer_seq(
-        &mut self,
-        first: UntypedExpr,
-        then: UntypedExpr,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        let first = self.infer(first, level)?;
-        let then = self.infer(then, level)?;
-
-        match first.typ().as_ref() {
-            typ if typ.is_result() => {
-                self.warnings.push(Warning::ImplicitlyDiscardedResult {
-                    location: first.location().clone(),
-                });
-            }
-
-            _ => {}
-        }
-
-        Ok(TypedExpr::Seq {
-            typ: then.typ(),
-            first: Box::new(first),
-            then: Box::new(then),
-        })
-    }
-
-    fn infer_fn(
-        &mut self,
-        args: Vec<UntypedArg>,
-        body: UntypedExpr,
-        is_capture: bool,
-        return_annotation: Option<TypeAst>,
-        level: usize,
-        location: SrcSpan,
-    ) -> Result<TypedExpr, Error> {
-        let mut fn_typer = FnTyper::new(self, level);
-        let (args, body) = fn_typer.do_infer_fn(args, body, &return_annotation)?;
-        let args_types = args.iter().map(|a| a.typ.clone()).collect();
-        let typ = fn_(args_types, body.typ());
-        Ok(TypedExpr::Fn {
-            location,
-            typ,
-            is_capture,
-            args,
-            body: Box::new(body),
-            return_annotation,
-        })
-    }
-
-    fn infer_call(
-        &mut self,
-        fun: UntypedExpr,
-        args: Vec<CallArg<UntypedExpr>>,
-        level: usize,
-        location: SrcSpan,
-    ) -> Result<TypedExpr, Error> {
-        let (fun, args, typ) = self.do_infer_call(fun, args, level, &location)?;
-        Ok(TypedExpr::Call {
-            location,
-            typ,
-            args,
-            fun: Box::new(fun),
-        })
-    }
-
-    fn infer_cons(
-        &mut self,
-        head: UntypedExpr,
-        tail: UntypedExpr,
-        deprecated_syntax: bool,
-        location: SrcSpan,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        let head = self.infer(head, level)?;
-        let tail = self.infer(tail, level)?;
-        unify(tail.typ(), list(head.typ()), self).map_err(|e| convert_unify_error(e, &location))?;
-
-        if deprecated_syntax {
-            self.warnings.push(Warning::DeprecatedListPrependSyntax {
-                location: SrcSpan {
-                    start: location.start - 2,
-                    end: location.start - 1,
-                },
-            });
-        }
-
-        Ok(TypedExpr::ListCons {
-            location,
-            typ: tail.typ(),
-            head: Box::new(head),
-            tail: Box::new(tail),
-        })
-    }
-
-    fn infer_tuple(
-        &mut self,
-        elems: Vec<UntypedExpr>,
-        location: SrcSpan,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        let elems = elems
-            .into_iter()
-            .map(|e| self.infer(e, level))
-            .collect::<Result<Vec<_>, _>>()?;
-        let typ = tuple(elems.iter().map(|e| e.typ()).collect());
-        Ok(TypedExpr::Tuple {
-            location,
-            elems,
-            typ,
-        })
-    }
-
-    fn infer_tuple_index(
-        &mut self,
-        tuple: UntypedExpr,
-        index: u64,
-        location: SrcSpan,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        let tuple = self.infer(tuple, level)?;
-
-        match tuple.typ().as_ref() {
-            Type::Tuple { elems } => {
-                let typ = elems
-                    .get(index as usize)
-                    .ok_or_else(|| Error::OutOfBoundsTupleIndex {
-                        location: location.clone(),
-                        index,
-                        size: elems.len(),
-                    })?
-                    .clone();
-                Ok(TypedExpr::TupleIndex {
-                    location,
-                    index,
-                    tuple: Box::new(tuple),
-                    typ,
-                })
-            }
-
-            typ if typ.is_unbound() => Err(Error::NotATupleUnbound {
-                location: tuple.location().clone(),
-            }),
-
-            _ => Err(Error::NotATuple {
-                location: tuple.location().clone(),
-                given: tuple.typ(),
-            }),
-        }
-    }
-
-    fn infer_binop(
-        &mut self,
-        name: BinOp,
-        left: UntypedExpr,
-        right: UntypedExpr,
-        level: usize,
-        location: SrcSpan,
-    ) -> Result<TypedExpr, Error> {
-        let (input_type, output_type) = match name {
-            BinOp::Eq | BinOp::NotEq => {
-                let left = self.infer(left, level)?;
-                let right = self.infer(right, level)?;
-                unify(left.typ(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-
-                return Ok(TypedExpr::BinOp {
-                    location,
-                    name,
-                    typ: bool(),
-                    left: Box::new(left),
-                    right: Box::new(right),
-                });
-            }
-            BinOp::And => (bool(), bool()),
-            BinOp::Or => (bool(), bool()),
-            BinOp::LtInt => (int(), bool()),
-            BinOp::LtEqInt => (int(), bool()),
-            BinOp::LtFloat => (float(), bool()),
-            BinOp::LtEqFloat => (float(), bool()),
-            BinOp::GtEqInt => (int(), bool()),
-            BinOp::GtInt => (int(), bool()),
-            BinOp::GtEqFloat => (float(), bool()),
-            BinOp::GtFloat => (float(), bool()),
-            BinOp::AddInt => (int(), int()),
-            BinOp::AddFloat => (float(), float()),
-            BinOp::SubInt => (int(), int()),
-            BinOp::SubFloat => (float(), float()),
-            BinOp::MultInt => (int(), int()),
-            BinOp::MultFloat => (float(), float()),
-            BinOp::DivInt => (int(), int()),
-            BinOp::DivFloat => (float(), float()),
-            BinOp::ModuloInt => (int(), int()),
-        };
-
-        let left = self.infer(left, level)?;
-        unify(input_type.clone(), left.typ(), self)
-            .map_err(|e| convert_unify_error(e, left.location()))?;
-        let right = self.infer(right, level)?;
-        unify(input_type, right.typ(), self)
-            .map_err(|e| convert_unify_error(e, right.location()))?;
-
-        Ok(TypedExpr::BinOp {
-            location,
-            name,
-            typ: output_type,
-            left: Box::new(left),
-            right: Box::new(right),
-        })
-    }
-
-    fn infer_let(
-        &mut self,
-        pattern: UntypedPattern,
-        value: UntypedExpr,
-        then: UntypedExpr,
-        kind: BindingKind,
-        annotation: &Option<TypeAst>,
-        level: usize,
-        location: SrcSpan,
-    ) -> Result<TypedExpr, Error> {
-        let value = self.infer(value, level + 1)?;
-        let try_value_type = self.new_unbound_var(level);
-        let try_error_type = self.new_unbound_var(level);
-
-        let value_typ = match kind {
-            // Ensure that the value is a result if this is a `try` binding
-            BindingKind::Try => {
-                let v = try_value_type.clone();
-                let e = try_error_type.clone();
-                unify(result(v, e), value.typ(), self)
-                    .map_err(|e| convert_unify_error(e, value.location()))?;
-                try_value_type.clone()
-            }
-            _ => value.typ(),
-        };
-
-        let value_typ = generalise(value_typ, level + 1);
-
-        // Ensure the pattern matches the type of the value
-        let pattern = PatternTyper::new(self, level).unify(pattern, value_typ.clone())?;
-
-        // Check the type of the following code
-        let then = self.infer(then, level)?;
-        let typ = then.typ();
-
-        // Ensure that a Result with the right error type is returned for `try`
-        if kind == BindingKind::Try {
-            let value = self.new_unbound_var(level);
-            unify(result(value, try_error_type), typ.clone(), self)
-                .map_err(|e| convert_unify_error(e, then.try_binding_location()))?;
-        }
-
-        // Check that any type annotation is accurate.
-        if let Some(ann) = annotation {
-            let ann_typ = self
-                .type_from_ast(ann, &mut hashmap![], NewTypeAction::MakeGeneric)
-                .map(|t| self.instantiate(t, level, &mut hashmap![]))?;
-            unify(ann_typ, value_typ, self)
-                .map_err(|e| convert_unify_error(e, value.location()))?;
-        }
-
-        Ok(TypedExpr::Let {
-            location,
-            typ,
-            kind,
-            pattern,
-            value: Box::new(value),
-            then: Box::new(then),
-        })
-    }
-
-    fn infer_case(
-        &mut self,
-        subjects: Vec<UntypedExpr>,
-        clauses: Vec<UntypedClause>,
-        level: usize,
-        location: SrcSpan,
-    ) -> Result<TypedExpr, Error> {
-        let subjects_count = subjects.len();
-        let mut typed_subjects = Vec::with_capacity(subjects_count);
-        let mut subject_types = Vec::with_capacity(subjects_count);
-        let mut typed_clauses = Vec::with_capacity(clauses.len());
-
-        let return_type = self.new_unbound_var(level);
-
-        for subject in subjects.into_iter() {
-            let subject = self.infer(subject, level + 1)?;
-            let subject_type = generalise(subject.typ(), level + 1);
-            typed_subjects.push(subject);
-            subject_types.push(subject_type);
-        }
-
-        for clause in clauses.into_iter() {
-            let typed_clause = self.infer_clause(clause, &subject_types, level)?;
-            unify(return_type.clone(), typed_clause.then.typ(), self)
-                .map_err(|e| convert_unify_error(e, typed_clause.then.location()))?;
-            typed_clauses.push(typed_clause);
-        }
-        Ok(TypedExpr::Case {
-            location,
-            typ: return_type,
-            subjects: typed_subjects,
-            clauses: typed_clauses,
-        })
-    }
-
-    fn infer_clause(
-        &mut self,
-        clause: UntypedClause,
-        subjects: &[Arc<Type>],
-        level: usize,
-    ) -> Result<TypedClause, Error> {
-        let Clause {
-            pattern,
-            alternative_patterns,
-            guard,
-            then,
-            location,
-        } = clause;
-
-        // Store the local scope so it can be reset after the clause
-        let vars = self.local_values.clone();
-
-        // Check the types
-        let (typed_pattern, typed_alternatives) =
-            self.infer_clause_pattern(pattern, alternative_patterns, subjects, level, &location)?;
-        let guard = self.infer_optional_clause_guard(guard, level)?;
-        let then = self.infer(then, level)?;
-
-        // Reset the local vars now the clause scope is done
-        self.local_values = vars;
-
-        Ok(Clause {
-            location,
-            pattern: typed_pattern,
-            alternative_patterns: typed_alternatives,
-            guard,
-            then,
-        })
-    }
-
-    fn infer_clause_pattern(
-        &mut self,
-        pattern: UntypedMultiPattern,
-        alternatives: Vec<UntypedMultiPattern>,
-        subjects: &[Arc<Type>],
-        level: usize,
-        location: &SrcSpan,
-    ) -> Result<(TypedMultiPattern, Vec<TypedMultiPattern>), Error> {
-        let mut pattern_typer = PatternTyper::new(self, level);
-        let typed_pattern = pattern_typer.infer_multi_pattern(pattern, subjects, &location)?;
-
-        // Each case clause has one or more patterns that may match the
-        // subject in order for the clause to be selected, so we must type
-        // check every pattern.
-        let mut typed_alternatives = Vec::with_capacity(alternatives.len());
-        for m in alternatives {
-            typed_alternatives
-                .push(pattern_typer.infer_alternative_multi_pattern(m, subjects, &location)?);
-        }
-
-        Ok((typed_pattern, typed_alternatives))
-    }
-
-    fn infer_optional_clause_guard(
-        &mut self,
-        guard: Option<UntypedClauseGuard>,
-        level: usize,
-    ) -> Result<Option<TypedClauseGuard>, Error> {
-        match guard {
-            // If there is no guard we do nothing
-            None => Ok(None),
-
-            // If there is a guard we assert that it is of type Bool
-            Some(guard) => {
-                let guard = self.infer_clause_guard(guard, level)?;
-                unify(bool(), guard.typ(), self)
-                    .map_err(|e| convert_unify_error(e, guard.location()))?;
-                Ok(Some(guard))
-            }
-        }
-    }
-
-    fn infer_clause_guard(
-        &mut self,
-        guard: UntypedClauseGuard,
-        level: usize,
-    ) -> Result<TypedClauseGuard, Error> {
-        match guard {
-            ClauseGuard::Var { location, name, .. } => {
-                let constructor = self.infer_value_constructor(&name, level, &location)?;
-
-                // We cannot support all values in guard expressions as the BEAM does not
-                match &constructor.variant {
-                    ValueConstructorVariant::LocalVariable => (),
-                    ValueConstructorVariant::ModuleFn { .. }
-                    | ValueConstructorVariant::Record { .. } => {
-                        return Err(Error::NonLocalClauseGuardVariable { location, name })
-                    }
-                };
-
-                Ok(ClauseGuard::Var {
-                    location,
-                    name,
-                    typ: constructor.typ,
-                })
-            }
-
-            ClauseGuard::Tuple {
-                location, elems, ..
-            } => {
-                let elems = elems
-                    .into_iter()
-                    .map(|x| self.infer_clause_guard(x, level))
-                    .collect::<Result<Vec<_>, _>>()?;
-
-                let typ = tuple(elems.iter().map(|e| e.typ()).collect());
-
-                Ok(ClauseGuard::Tuple {
-                    location,
-                    elems,
-                    typ,
-                })
-            }
-
-            ClauseGuard::And {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                unify(bool(), left.typ(), self)
-                    .map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(bool(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-                Ok(ClauseGuard::And {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::Or {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                unify(bool(), left.typ(), self)
-                    .map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(bool(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-                Ok(ClauseGuard::Or {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::Equals {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(left.typ(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, &location))?;
-                Ok(ClauseGuard::Equals {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::NotEquals {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(left.typ(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, &location))?;
-                Ok(ClauseGuard::NotEquals {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::GtInt {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                unify(int(), left.typ(), self)
-                    .map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(int(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-                Ok(ClauseGuard::GtInt {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::GtEqInt {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                unify(int(), left.typ(), self)
-                    .map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(int(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-                Ok(ClauseGuard::GtEqInt {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::LtInt {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                unify(int(), left.typ(), self)
-                    .map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(int(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-                Ok(ClauseGuard::LtInt {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::LtEqInt {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                unify(int(), left.typ(), self)
-                    .map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(int(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-                Ok(ClauseGuard::LtEqInt {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::GtFloat {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                unify(float(), left.typ(), self)
-                    .map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(float(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-                Ok(ClauseGuard::GtFloat {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::GtEqFloat {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                unify(float(), left.typ(), self)
-                    .map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(float(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-                Ok(ClauseGuard::GtEqFloat {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::LtFloat {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                unify(float(), left.typ(), self)
-                    .map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(float(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-                Ok(ClauseGuard::LtFloat {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::LtEqFloat {
-                location,
-                left,
-                right,
-                ..
-            } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                unify(float(), left.typ(), self)
-                    .map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
-                unify(float(), right.typ(), self)
-                    .map_err(|e| convert_unify_error(e, right.location()))?;
-                Ok(ClauseGuard::LtEqFloat {
-                    location,
-                    left: Box::new(left),
-                    right: Box::new(right),
-                })
-            }
-
-            ClauseGuard::Int {
-                location, value, ..
-            } => Ok(ClauseGuard::Int { location, value }),
-
-            ClauseGuard::Float {
-                location, value, ..
-            } => Ok(ClauseGuard::Float { location, value }),
-        }
-    }
-
-    fn infer_module_access(
-        &mut self,
-        module_alias: &str,
-        label: String,
-        level: usize,
-        module_location: &SrcSpan,
-        select_location: SrcSpan,
-    ) -> Result<TypedExpr, Error> {
-        let (module_name, constructor) = {
-            let module_info =
-                self.imported_modules
-                    .get(&*module_alias)
-                    .ok_or_else(|| Error::UnknownModule {
-                        name: module_alias.to_string(),
-                        location: module_location.clone(),
-                        imported_modules: self
-                            .imported_modules
-                            .keys()
-                            .map(|t| t.to_string())
-                            .collect(),
-                    })?;
-
-            let constructor =
-                module_info
-                    .values
-                    .get(&label)
-                    .ok_or_else(|| Error::UnknownModuleValue {
-                        name: label.clone(),
-                        location: select_location.clone(),
-                        module_name: module_info.name.clone(),
-                        value_constructors: module_info
-                            .values
-                            .keys()
-                            .map(|t| t.to_string())
-                            .collect(),
-                    })?;
-
-            (module_info.name.clone(), constructor.clone())
-        };
-
-        Ok(TypedExpr::ModuleSelect {
-            label,
-            typ: self.instantiate(constructor.typ, level, &mut hashmap![]),
-            location: select_location,
-            module_name,
-            module_alias: module_alias.to_string(),
-            constructor: constructor.variant.to_module_value_constructor(),
-        })
-    }
-
-    fn infer_record_access(
-        &mut self,
-        record: UntypedExpr,
-        label: String,
-        level: usize,
-        location: SrcSpan,
-    ) -> Result<TypedExpr, Error> {
-        // Infer the type of the (presumed) record
-        let record = Box::new(self.infer(record, level)?);
-
-        // If we don't yet know the type of the record then we cannot use any accessors
-        if record.typ().is_unbound() {
-            return Err(Error::RecordAccessUnknownType {
-                location: record.location().clone(),
-            });
-        }
-
-        // Error constructor helper function
-        let unknown_field = |fields| Error::UnknownField {
-            typ: record.typ(),
-            location: location.clone(),
-            label: label.clone(),
-            fields,
-        };
-
-        // Check to see if it's a Type that can have accessible fields
-        let accessors = match collapse_links(record.typ()).as_ref() {
-            // A type in the current module which may have fields
-            Type::App { module, name, .. } if module.as_slice() == self.current_module => {
-                self.accessors.get(name)
-            }
-
-            // A type in another module which may have fields
-            Type::App { module, name, .. } => self
-                .importable_modules
-                .get(&module.join("/"))
-                .and_then(|module| module.accessors.get(name)),
-
-            _something_without_fields => return Err(unknown_field(vec![])),
-        }
-        .ok_or_else(|| unknown_field(vec![]))?;
-
-        // Find the accessor, if the type has one with the same label
-        let RecordAccessor {
-            index, label, typ, ..
-        } = accessors
-            .accessors
-            .get(&label)
-            .ok_or_else(|| {
-                unknown_field(accessors.accessors.keys().map(|t| t.to_string()).collect())
-            })?
-            .clone();
-
-        // Unify the record type with the accessor's stored copy of the record type.
-        // This ensure that the type parameters of the retrieved value have the correct
-        // types for this instance of the record.
-        let accessor_record_type = accessors.typ.clone();
-        let mut type_vars = hashmap![];
-        let accessor_record_type = self.instantiate(accessor_record_type, 0, &mut type_vars);
-        let typ = self.instantiate(typ, 0, &mut type_vars);
-        unify(accessor_record_type, record.typ(), self)
-            .map_err(|e| convert_unify_error(e, record.location()))?;
-
-        Ok(TypedExpr::RecordAccess {
-            record,
-            label,
-            index,
-            location,
-            typ,
-        })
-    }
-
-    fn do_infer_call(
-        &mut self,
-        fun: UntypedExpr,
-        args: Vec<CallArg<UntypedExpr>>,
-        level: usize,
-        location: &SrcSpan,
-    ) -> Result<(TypedExpr, Vec<TypedCallArg>, Arc<Type>), Error> {
-        let fun = self.infer(fun, level)?;
-        let (fun, args, typ) = self.do_infer_call_with_known_fun(fun, args, level, location)?;
-        Ok((fun, args, typ))
-    }
-
-    fn do_infer_call_with_known_fun(
-        &mut self,
-        fun: TypedExpr,
-        mut args: Vec<CallArg<UntypedExpr>>,
-        level: usize,
-        location: &SrcSpan,
-    ) -> Result<(TypedExpr, Vec<TypedCallArg>, Arc<Type>), Error> {
-        match get_field_map(&fun, self)
-            .map_err(|e| convert_get_value_constructor_error(e, location))?
-        {
-            // The fun has a field map so labelled arguments may be present and need to be reordered.
-            Some(field_map) => field_map.reorder(&mut args, location)?,
-
-            // The fun has no field map and so we error if arguments have been labelled
-            None => assert_no_labelled_arguments(&args)?,
-        }
-
-        let (mut args_types, return_type) = self
-            .match_fun_type(fun.typ(), args.len())
-            .map_err(|e| convert_not_fun_error(e, fun.location(), &location))?;
-        let args = args_types
-            .iter_mut()
-            .zip(args)
-            .map(
-                |(
-                    typ,
-                    CallArg {
-                        label,
-                        value,
-                        location,
-                    },
-                ): (&mut Arc<Type>, _)| {
-                    let value = self.infer(value, level)?;
-                    unify(typ.clone(), value.typ(), self)
-                        .map_err(|e| convert_unify_error(e, value.location()))?;
-                    Ok(CallArg {
-                        label,
-                        value,
-                        location,
-                    })
-                },
-            )
-            .collect::<Result<_, _>>()?;
-        Ok((fun, args, return_type))
-    }
-
-    fn infer_value_constructor(
-        &mut self,
-        name: &str,
-        level: usize,
-        location: &SrcSpan,
-    ) -> Result<ValueConstructor, Error> {
-        let ValueConstructor {
-            public,
-            variant,
-            origin,
-            typ,
-        } = self
-            .get_variable(name)
-            .cloned()
-            .ok_or_else(|| Error::UnknownVariable {
-                location: location.clone(),
-                name: name.to_string(),
-                variables: self.local_values.keys().map(|t| t.to_string()).collect(),
-            })?;
-        let typ = self.instantiate(typ, level, &mut hashmap![]);
-        Ok(ValueConstructor {
-            public,
-            variant,
-            origin,
-            typ,
-        })
-    }
-
-    fn infer_arg(
-        &mut self,
-        arg: UntypedArg,
-        type_vars: &mut im::HashMap<String, (usize, Arc<Type>)>,
-        level: usize,
-    ) -> Result<TypedArg, Error> {
-        let Arg {
-            names,
-            annotation,
-            location,
-            ..
-        } = arg;
-        let typ = annotation
-            .clone()
-            .map(|t| self.type_from_ast(&t, type_vars, NewTypeAction::MakeGeneric))
-            .unwrap_or_else(|| Ok(self.new_unbound_var(level)))?;
-        Ok(Arg {
-            names,
-            location,
-            annotation,
-            typ,
-        })
     }
 
     fn make_type_vars(
@@ -2655,7 +1481,7 @@ pub fn infer_module(
                 let typ = fn_(args_types, body.typ());
 
                 // Assert that the inferred type matches the type of any recursive call
-                unify(rec, typ.clone(), &typer).map_err(|e| convert_unify_error(e, &location))?;
+                unify(rec, typ.clone()).map_err(|e| convert_unify_error(e, &location))?;
                 let typ = generalise(typ, level);
 
                 // Insert the function into the module's interface
@@ -3034,7 +1860,7 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
             PatternMode::Alternative => match self.typer.local_values.get(name) {
                 // This variable was defined in the Initial multi-pattern
                 Some(initial) if self.initial_pattern_vars.contains(name) => {
-                    unify(initial.typ.clone(), typ, self.typer)
+                    unify(initial.typ.clone(), typ)
                 }
 
                 // This variable was not defined in the Initial multi-pattern
@@ -3101,27 +1927,23 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
             }
 
             Pattern::Int { location, value } => {
-                unify(typ, int(), self.typer).map_err(|e| convert_unify_error(e, &location))?;
+                unify(typ, int()).map_err(|e| convert_unify_error(e, &location))?;
                 Ok(Pattern::Int { location, value })
             }
 
             Pattern::Float { location, value } => {
-                unify(typ, float(), self.typer).map_err(|e| convert_unify_error(e, &location))?;
+                unify(typ, float()).map_err(|e| convert_unify_error(e, &location))?;
                 Ok(Pattern::Float { location, value })
             }
 
             Pattern::String { location, value } => {
-                unify(typ, string(), self.typer).map_err(|e| convert_unify_error(e, &location))?;
+                unify(typ, string()).map_err(|e| convert_unify_error(e, &location))?;
                 Ok(Pattern::String { location, value })
             }
 
             Pattern::Nil { location } => {
-                unify(
-                    typ,
-                    list(self.typer.new_unbound_var(self.level)),
-                    self.typer,
-                )
-                .map_err(|e| convert_unify_error(e, &location))?;
+                unify(typ, list(self.typer.new_unbound_var(self.level)))
+                    .map_err(|e| convert_unify_error(e, &location))?;
                 Ok(Pattern::Nil { location })
             }
 
@@ -3175,7 +1997,7 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
                     let elems_types = (0..(elems.len()))
                         .map(|_| self.typer.new_unbound_var(self.level))
                         .collect();
-                    unify(tuple(elems_types), typ.clone(), self.typer)
+                    unify(tuple(elems_types), typ.clone())
                         .map_err(|e| convert_unify_error(e, &location))?;
                     self.unify(Pattern::Tuple { elems, location }, typ)
                 }
@@ -3294,7 +2116,7 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
                                     })
                                 })
                                 .collect::<Result<Vec<_>, _>>()?;
-                            unify(typ, retrn.clone(), self.typer)
+                            unify(typ, retrn.clone())
                                 .map_err(|e| convert_unify_error(e, &location))?;
                             Ok(Pattern::Constructor {
                                 location,
@@ -3315,7 +2137,7 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
 
                     Type::App { .. } => {
                         if pattern_args.is_empty() {
-                            unify(typ, instantiated_constructor_type, self.typer)
+                            unify(typ, instantiated_constructor_type)
                                 .map_err(|e| convert_unify_error(e, &location))?;
                             Ok(Pattern::Constructor {
                                 location,
@@ -3353,6 +2175,106 @@ impl<'a, 'b, 'c> FnTyper<'a, 'b, 'c> {
         Self { typer, level }
     }
 
+    /// Crawl the AST, annotating each node with the inferred type or
+    /// returning an error.
+    ///
+    pub fn infer(&mut self, expr: UntypedExpr, level: usize) -> Result<TypedExpr, Error> {
+        match expr {
+            UntypedExpr::ListNil { location, .. } => self.infer_nil(location, level),
+
+            UntypedExpr::Todo { location, .. } => self.infer_todo(location, level),
+
+            UntypedExpr::Var { location, name, .. } => self.infer_var(name, location, level),
+
+            UntypedExpr::Int {
+                location, value, ..
+            } => self.infer_int(value, location),
+
+            UntypedExpr::Seq { first, then, .. } => self.infer_seq(*first, *then, level),
+
+            UntypedExpr::Tuple {
+                location, elems, ..
+            } => self.infer_tuple(elems, location, level),
+
+            UntypedExpr::Float {
+                location, value, ..
+            } => self.infer_float(value, location),
+
+            UntypedExpr::String {
+                location, value, ..
+            } => self.infer_string(value, location),
+
+            UntypedExpr::Pipe {
+                left,
+                right,
+                location,
+            } => self.infer_pipe(*left, *right, location, level),
+
+            UntypedExpr::Fn {
+                location,
+                is_capture,
+                args,
+                body,
+                return_annotation,
+                ..
+            } => self.infer_fn(args, *body, is_capture, return_annotation, level, location),
+
+            UntypedExpr::Let {
+                location,
+                pattern,
+                value,
+                then,
+                kind,
+                annotation,
+                ..
+            } => self.infer_let(pattern, *value, *then, kind, &annotation, level, location),
+
+            UntypedExpr::Case {
+                location,
+                subjects,
+                clauses,
+                ..
+            } => self.infer_case(subjects, clauses, level, location),
+
+            UntypedExpr::ListCons {
+                location,
+                head,
+                tail,
+                deprecated_syntax,
+                ..
+            } => self.infer_cons(*head, *tail, deprecated_syntax, location, level),
+
+            UntypedExpr::Call {
+                location,
+                fun,
+                args,
+                ..
+            } => self.infer_call(*fun, args, level, location),
+
+            UntypedExpr::BinOp {
+                location,
+                name,
+                left,
+                right,
+                ..
+            } => self.infer_binop(name, *left, *right, level, location),
+
+            UntypedExpr::FieldAccess {
+                location,
+                label,
+                container,
+                ..
+            } => self.infer_field_access(*container, label, location, level),
+
+            UntypedExpr::TupleIndex {
+                location,
+                index,
+                tuple,
+                ..
+            } => self.infer_tuple_index(*tuple, index, location, level),
+        }
+    }
+
     pub fn do_infer_fn(
         &mut self,
         args: Vec<UntypedArg>,
@@ -3364,7 +2286,7 @@ impl<'a, 'b, 'c> FnTyper<'a, 'b, 'c> {
         let mut type_vars = hashmap![];
         let args: Vec<_> = args
             .into_iter()
-            .map(|arg| self.typer.infer_arg(arg, &mut type_vars, self.level))
+            .map(|arg| self.infer_arg(arg, &mut type_vars, self.level))
             .collect::<Result<_, _>>()?;
 
         // Record generic type variables that comes from type annotations.
@@ -3385,21 +2307,1098 @@ impl<'a, 'b, 'c> FnTyper<'a, 'b, 'c> {
             };
         }
 
-        let body = self.typer.infer(body, self.level)?;
+        let body = self.infer(body, self.level)?;
 
         // Check that any return type annotation is accurate.
         if let Some(ann) = return_annotation {
             let ret_typ =
                 self.typer
                     .type_from_ast(ann, &mut type_vars, NewTypeAction::MakeGeneric)?;
-            unify(ret_typ, body.typ(), self.typer)
-                .map_err(|e| convert_unify_error(e, body.location()))?;
+            unify(ret_typ, body.typ()).map_err(|e| convert_unify_error(e, body.location()))?;
         }
 
         // Reset the typer now that the scope of the function has ended.
         self.typer.local_values = previous_vars;
         self.typer.annotated_generic_types = previous_annotated_generic_types;
         Ok((args, body))
+    }
+
+    fn infer_nil(&mut self, location: SrcSpan, level: usize) -> Result<TypedExpr, Error> {
+        Ok(TypedExpr::ListNil {
+            location,
+            typ: list(self.typer.new_unbound_var(level)),
+        })
+    }
+
+    fn infer_todo(&mut self, location: SrcSpan, level: usize) -> Result<TypedExpr, Error> {
+        self.typer.warnings.push(Warning::Todo {
+            location: location.clone(),
+        });
+
+        Ok(TypedExpr::Todo {
+            location,
+            typ: self.typer.new_unbound_var(level),
+        })
+    }
+
+    fn infer_string(&mut self, value: String, location: SrcSpan) -> Result<TypedExpr, Error> {
+        Ok(TypedExpr::String {
+            location,
+            value,
+            typ: string(),
+        })
+    }
+
+    fn infer_int(&mut self, value: String, location: SrcSpan) -> Result<TypedExpr, Error> {
+        Ok(TypedExpr::Int {
+            location,
+            value,
+            typ: int(),
+        })
+    }
+
+    fn infer_float(&mut self, value: String, location: SrcSpan) -> Result<TypedExpr, Error> {
+        Ok(TypedExpr::Float {
+            location,
+            value,
+            typ: float(),
+        })
+    }
+
+    fn infer_seq(
+        &mut self,
+        first: UntypedExpr,
+        then: UntypedExpr,
+        level: usize,
+    ) -> Result<TypedExpr, Error> {
+        let first = self.infer(first, level)?;
+        let then = self.infer(then, level)?;
+
+        match first.typ().as_ref() {
+            typ if typ.is_result() => {
+                self.typer
+                    .warnings
+                    .push(Warning::ImplicitlyDiscardedResult {
+                        location: first.location().clone(),
+                    });
+            }
+
+            _ => {}
+        }
+
+        Ok(TypedExpr::Seq {
+            typ: then.typ(),
+            first: Box::new(first),
+            then: Box::new(then),
+        })
+    }
+
+    fn infer_fn(
+        &mut self,
+        args: Vec<UntypedArg>,
+        body: UntypedExpr,
+        is_capture: bool,
+        return_annotation: Option<TypeAst>,
+        level: usize,
+        location: SrcSpan,
+    ) -> Result<TypedExpr, Error> {
+        let mut fn_typer = FnTyper::new(self.typer, level);
+        let (args, body) = fn_typer.do_infer_fn(args, body, &return_annotation)?;
+        let args_types = args.iter().map(|a| a.typ.clone()).collect();
+        let typ = fn_(args_types, body.typ());
+        Ok(TypedExpr::Fn {
+            location,
+            typ,
+            is_capture,
+            args,
+            body: Box::new(body),
+            return_annotation,
+        })
+    }
+
+    fn infer_call(
+        &mut self,
+        fun: UntypedExpr,
+        args: Vec<CallArg<UntypedExpr>>,
+        level: usize,
+        location: SrcSpan,
+    ) -> Result<TypedExpr, Error> {
+        let (fun, args, typ) = self.do_infer_call(fun, args, level, &location)?;
+        Ok(TypedExpr::Call {
+            location,
+            typ,
+            args,
+            fun: Box::new(fun),
+        })
+    }
+
+    fn infer_cons(
+        &mut self,
+        head: UntypedExpr,
+        tail: UntypedExpr,
+        deprecated_syntax: bool,
+        location: SrcSpan,
+        level: usize,
+    ) -> Result<TypedExpr, Error> {
+        let head = self.infer(head, level)?;
+        let tail = self.infer(tail, level)?;
+        unify(tail.typ(), list(head.typ())).map_err(|e| convert_unify_error(e, &location))?;
+
+        if deprecated_syntax {
+            self.typer
+                .warnings
+                .push(Warning::DeprecatedListPrependSyntax {
+                    location: SrcSpan {
+                        start: location.start - 2,
+                        end: location.start - 1,
+                    },
+                });
+        }
+
+        Ok(TypedExpr::ListCons {
+            location,
+            typ: tail.typ(),
+            head: Box::new(head),
+            tail: Box::new(tail),
+        })
+    }
+
+    fn infer_tuple(
+        &mut self,
+        elems: Vec<UntypedExpr>,
+        location: SrcSpan,
+        level: usize,
+    ) -> Result<TypedExpr, Error> {
+        let elems = elems
+            .into_iter()
+            .map(|e| self.infer(e, level))
+            .collect::<Result<Vec<_>, _>>()?;
+        let typ = tuple(elems.iter().map(|e| e.typ()).collect());
+        Ok(TypedExpr::Tuple {
+            location,
+            elems,
+            typ,
+        })
+    }
+
+    fn infer_tuple_index(
+        &mut self,
+        tuple: UntypedExpr,
+        index: u64,
+        location: SrcSpan,
+        level: usize,
+    ) -> Result<TypedExpr, Error> {
+        let tuple = self.infer(tuple, level)?;
+
+        match tuple.typ().as_ref() {
+            Type::Tuple { elems } => {
+                let typ = elems
+                    .get(index as usize)
+                    .ok_or_else(|| Error::OutOfBoundsTupleIndex {
+                        location: location.clone(),
+                        index,
+                        size: elems.len(),
+                    })?
+                    .clone();
+                Ok(TypedExpr::TupleIndex {
+                    location,
+                    index,
+                    tuple: Box::new(tuple),
+                    typ,
+                })
+            }
+
+            typ if typ.is_unbound() => Err(Error::NotATupleUnbound {
+                location: tuple.location().clone(),
+            }),
+
+            _ => Err(Error::NotATuple {
+                location: tuple.location().clone(),
+                given: tuple.typ(),
+            }),
+        }
+    }
+
+    fn infer_binop(
+        &mut self,
+        name: BinOp,
+        left: UntypedExpr,
+        right: UntypedExpr,
+        level: usize,
+        location: SrcSpan,
+    ) -> Result<TypedExpr, Error> {
+        let (input_type, output_type) = match name {
+            BinOp::Eq | BinOp::NotEq => {
+                let left = self.infer(left, level)?;
+                let right = self.infer(right, level)?;
+                unify(left.typ(), right.typ())
+                    .map_err(|e| convert_unify_error(e, right.location()))?;
+
+                return Ok(TypedExpr::BinOp {
+                    location,
+                    name,
+                    typ: bool(),
+                    left: Box::new(left),
+                    right: Box::new(right),
+                });
+            }
+            BinOp::And => (bool(), bool()),
+            BinOp::Or => (bool(), bool()),
+            BinOp::LtInt => (int(), bool()),
+            BinOp::LtEqInt => (int(), bool()),
+            BinOp::LtFloat => (float(), bool()),
+            BinOp::LtEqFloat => (float(), bool()),
+            BinOp::GtEqInt => (int(), bool()),
+            BinOp::GtInt => (int(), bool()),
+            BinOp::GtEqFloat => (float(), bool()),
+            BinOp::GtFloat => (float(), bool()),
+            BinOp::AddInt => (int(), int()),
+            BinOp::AddFloat => (float(), float()),
+            BinOp::SubInt => (int(), int()),
+            BinOp::SubFloat => (float(), float()),
+            BinOp::MultInt => (int(), int()),
+            BinOp::MultFloat => (float(), float()),
+            BinOp::DivInt => (int(), int()),
+            BinOp::DivFloat => (float(), float()),
+            BinOp::ModuloInt => (int(), int()),
+        };
+
+        let left = self.infer(left, level)?;
+        unify(input_type.clone(), left.typ())
+            .map_err(|e| convert_unify_error(e, left.location()))?;
+        let right = self.infer(right, level)?;
+        unify(input_type, right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
+
+        Ok(TypedExpr::BinOp {
+            location,
+            name,
+            typ: output_type,
+            left: Box::new(left),
+            right: Box::new(right),
+        })
+    }
+
+    fn infer_let(
+        &mut self,
+        pattern: UntypedPattern,
+        value: UntypedExpr,
+        then: UntypedExpr,
+        kind: BindingKind,
+        annotation: &Option<TypeAst>,
+        level: usize,
+        location: SrcSpan,
+    ) -> Result<TypedExpr, Error> {
+        let value = self.infer(value, level + 1)?;
+        let try_value_type = self.typer.new_unbound_var(level);
+        let try_error_type = self.typer.new_unbound_var(level);
+
+        let value_typ = match kind {
+            // Ensure that the value is a result if this is a `try` binding
+            BindingKind::Try => {
+                let v = try_value_type.clone();
+                let e = try_error_type.clone();
+                unify(result(v, e), value.typ())
+                    .map_err(|e| convert_unify_error(e, value.location()))?;
+                try_value_type.clone()
+            }
+            _ => value.typ(),
+        };
+
+        let value_typ = generalise(value_typ, level + 1);
+
+        // Ensure the pattern matches the type of the value
+        let pattern = PatternTyper::new(self.typer, level).unify(pattern, value_typ.clone())?;
+
+        // Check the type of the following code
+        let then = self.infer(then, level)?;
+        let typ = then.typ();
+
+        // Ensure that a Result with the right error type is returned for `try`
+        if kind == BindingKind::Try {
+            let value = self.typer.new_unbound_var(level);
+            unify(result(value, try_error_type), typ.clone())
+                .map_err(|e| convert_unify_error(e, then.try_binding_location()))?;
+        }
+
+        // Check that any type annotation is accurate.
+        if let Some(ann) = annotation {
+            let ann_typ = self
+                .typer
+                .type_from_ast(ann, &mut hashmap![], NewTypeAction::MakeGeneric)
+                .map(|t| self.typer.instantiate(t, level, &mut hashmap![]))?;
+            unify(ann_typ, value_typ).map_err(|e| convert_unify_error(e, value.location()))?;
+        }
+
+        Ok(TypedExpr::Let {
+            location,
+            typ,
+            kind,
+            pattern,
+            value: Box::new(value),
+            then: Box::new(then),
+        })
+    }
+
+    fn infer_case(
+        &mut self,
+        subjects: Vec<UntypedExpr>,
+        clauses: Vec<UntypedClause>,
+        level: usize,
+        location: SrcSpan,
+    ) -> Result<TypedExpr, Error> {
+        let subjects_count = subjects.len();
+        let mut typed_subjects = Vec::with_capacity(subjects_count);
+        let mut subject_types = Vec::with_capacity(subjects_count);
+        let mut typed_clauses = Vec::with_capacity(clauses.len());
+
+        let return_type = self.typer.new_unbound_var(level);
+
+        for subject in subjects.into_iter() {
+            let subject = self.infer(subject, level + 1)?;
+            let subject_type = generalise(subject.typ(), level + 1);
+            typed_subjects.push(subject);
+            subject_types.push(subject_type);
+        }
+
+        for clause in clauses.into_iter() {
+            let typed_clause = self.infer_clause(clause, &subject_types, level)?;
+            unify(return_type.clone(), typed_clause.then.typ())
+                .map_err(|e| convert_unify_error(e, typed_clause.then.location()))?;
+            typed_clauses.push(typed_clause);
+        }
+        Ok(TypedExpr::Case {
+            location,
+            typ: return_type,
+            subjects: typed_subjects,
+            clauses: typed_clauses,
+        })
+    }
+
+    fn infer_clause(
+        &mut self,
+        clause: UntypedClause,
+        subjects: &[Arc<Type>],
+        level: usize,
+    ) -> Result<TypedClause, Error> {
+        let Clause {
+            pattern,
+            alternative_patterns,
+            guard,
+            then,
+            location,
+        } = clause;
+
+        // Store the local scope so it can be reset after the clause
+        let vars = self.typer.local_values.clone();
+
+        // Check the types
+        let (typed_pattern, typed_alternatives) =
+            self.infer_clause_pattern(pattern, alternative_patterns, subjects, level, &location)?;
+        let guard = self.infer_optional_clause_guard(guard, level)?;
+        let then = self.infer(then, level)?;
+
+        // Reset the local vars now the clause scope is done
+        self.typer.local_values = vars;
+
+        Ok(Clause {
+            location,
+            pattern: typed_pattern,
+            alternative_patterns: typed_alternatives,
+            guard,
+            then,
+        })
+    }
+
+    fn infer_clause_pattern(
+        &mut self,
+        pattern: UntypedMultiPattern,
+        alternatives: Vec<UntypedMultiPattern>,
+        subjects: &[Arc<Type>],
+        level: usize,
+        location: &SrcSpan,
+    ) -> Result<(TypedMultiPattern, Vec<TypedMultiPattern>), Error> {
+        let mut pattern_typer = PatternTyper::new(self.typer, level);
+        let typed_pattern = pattern_typer.infer_multi_pattern(pattern, subjects, &location)?;
+
+        // Each case clause has one or more patterns that may match the
+        // subject in order for the clause to be selected, so we must type
+        // check every pattern.
+        let mut typed_alternatives = Vec::with_capacity(alternatives.len());
+        for m in alternatives {
+            typed_alternatives
+                .push(pattern_typer.infer_alternative_multi_pattern(m, subjects, &location)?);
+        }
+
+        Ok((typed_pattern, typed_alternatives))
+    }
+
+    fn infer_optional_clause_guard(
+        &mut self,
+        guard: Option<UntypedClauseGuard>,
+        level: usize,
+    ) -> Result<Option<TypedClauseGuard>, Error> {
+        match guard {
+            // If there is no guard we do nothing
+            None => Ok(None),
+
+            // If there is a guard we assert that it is of type Bool
+            Some(guard) => {
+                let guard = self.infer_clause_guard(guard, level)?;
+                unify(bool(), guard.typ()).map_err(|e| convert_unify_error(e, guard.location()))?;
+                Ok(Some(guard))
+            }
+        }
+    }
+
+    fn infer_clause_guard(
+        &mut self,
+        guard: UntypedClauseGuard,
+        level: usize,
+    ) -> Result<TypedClauseGuard, Error> {
+        match guard {
+            ClauseGuard::Var { location, name, .. } => {
+                let constructor = self.infer_value_constructor(&name, level, &location)?;
+
+                // We cannot support all values in guard expressions as the BEAM does not
+                match &constructor.variant {
+                    ValueConstructorVariant::LocalVariable => (),
+                    ValueConstructorVariant::ModuleFn { .. }
+                    | ValueConstructorVariant::Record { .. } => {
+                        return Err(Error::NonLocalClauseGuardVariable { location, name })
+                    }
+                };
+
+                Ok(ClauseGuard::Var {
+                    location,
+                    name,
+                    typ: constructor.typ,
+                })
+            }
+
+            ClauseGuard::Tuple {
+                location, elems, ..
+            } => {
+                let elems = elems
+                    .into_iter()
+                    .map(|x| self.infer_clause_guard(x, level))
+                    .collect::<Result<Vec<_>, _>>()?;
+
+                let typ = tuple(elems.iter().map(|e| e.typ()).collect());
+
+                Ok(ClauseGuard::Tuple {
+                    location,
+                    elems,
+                    typ,
+                })
+            }
+
+            ClauseGuard::And {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                unify(bool(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(bool(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
+                Ok(ClauseGuard::And {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::Or {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                unify(bool(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(bool(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
+                Ok(ClauseGuard::Or {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::Equals {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(left.typ(), right.typ()).map_err(|e| convert_unify_error(e, &location))?;
+                Ok(ClauseGuard::Equals {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::NotEquals {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(left.typ(), right.typ()).map_err(|e| convert_unify_error(e, &location))?;
+                Ok(ClauseGuard::NotEquals {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::GtInt {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                unify(int(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(int(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
+                Ok(ClauseGuard::GtInt {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::GtEqInt {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                unify(int(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(int(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
+                Ok(ClauseGuard::GtEqInt {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::LtInt {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                unify(int(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(int(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
+                Ok(ClauseGuard::LtInt {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::LtEqInt {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                unify(int(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(int(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
+                Ok(ClauseGuard::LtEqInt {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::GtFloat {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                unify(float(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(float(), right.typ())
+                    .map_err(|e| convert_unify_error(e, right.location()))?;
+                Ok(ClauseGuard::GtFloat {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::GtEqFloat {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                unify(float(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(float(), right.typ())
+                    .map_err(|e| convert_unify_error(e, right.location()))?;
+                Ok(ClauseGuard::GtEqFloat {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::LtFloat {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                unify(float(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(float(), right.typ())
+                    .map_err(|e| convert_unify_error(e, right.location()))?;
+                Ok(ClauseGuard::LtFloat {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::LtEqFloat {
+                location,
+                left,
+                right,
+                ..
+            } => {
+                let left = self.infer_clause_guard(*left, level)?;
+                unify(float(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
+                let right = self.infer_clause_guard(*right, level)?;
+                unify(float(), right.typ())
+                    .map_err(|e| convert_unify_error(e, right.location()))?;
+                Ok(ClauseGuard::LtEqFloat {
+                    location,
+                    left: Box::new(left),
+                    right: Box::new(right),
+                })
+            }
+
+            ClauseGuard::Int {
+                location, value, ..
+            } => Ok(ClauseGuard::Int { location, value }),
+
+            ClauseGuard::Float {
+                location, value, ..
+            } => Ok(ClauseGuard::Float { location, value }),
+        }
+    }
+
+    fn infer_module_access(
+        &mut self,
+        module_alias: &str,
+        label: String,
+        level: usize,
+        module_location: &SrcSpan,
+        select_location: SrcSpan,
+    ) -> Result<TypedExpr, Error> {
+        let (module_name, constructor) = {
+            let module_info = self
+                .typer
+                .imported_modules
+                .get(&*module_alias)
+                .ok_or_else(|| Error::UnknownModule {
+                    name: module_alias.to_string(),
+                    location: module_location.clone(),
+                    imported_modules: self
+                        .typer
+                        .imported_modules
+                        .keys()
+                        .map(|t| t.to_string())
+                        .collect(),
+                })?;
+
+            let constructor =
+                module_info
+                    .values
+                    .get(&label)
+                    .ok_or_else(|| Error::UnknownModuleValue {
+                        name: label.clone(),
+                        location: select_location.clone(),
+                        module_name: module_info.name.clone(),
+                        value_constructors: module_info
+                            .values
+                            .keys()
+                            .map(|t| t.to_string())
+                            .collect(),
+                    })?;
+
+            (module_info.name.clone(), constructor.clone())
+        };
+
+        Ok(TypedExpr::ModuleSelect {
+            label,
+            typ: self
+                .typer
+                .instantiate(constructor.typ, level, &mut hashmap![]),
+            location: select_location,
+            module_name,
+            module_alias: module_alias.to_string(),
+            constructor: constructor.variant.to_module_value_constructor(),
+        })
+    }
+
+    fn infer_record_access(
+        &mut self,
+        record: UntypedExpr,
+        label: String,
+        level: usize,
+        location: SrcSpan,
+    ) -> Result<TypedExpr, Error> {
+        // Infer the type of the (presumed) record
+        let record = Box::new(self.infer(record, level)?);
+
+        // If we don't yet know the type of the record then we cannot use any accessors
+        if record.typ().is_unbound() {
+            return Err(Error::RecordAccessUnknownType {
+                location: record.location().clone(),
+            });
+        }
+
+        // Error constructor helper function
+        let unknown_field = |fields| Error::UnknownField {
+            typ: record.typ(),
+            location: location.clone(),
+            label: label.clone(),
+            fields,
+        };
+
+        // Check to see if it's a Type that can have accessible fields
+        let accessors = match collapse_links(record.typ()).as_ref() {
+            // A type in the current module which may have fields
+            Type::App { module, name, .. } if module.as_slice() == self.typer.current_module => {
+                self.typer.accessors.get(name)
+            }
+
+            // A type in another module which may have fields
+            Type::App { module, name, .. } => self
+                .typer
+                .importable_modules
+                .get(&module.join("/"))
+                .and_then(|module| module.accessors.get(name)),
+
+            _something_without_fields => return Err(unknown_field(vec![])),
+        }
+        .ok_or_else(|| unknown_field(vec![]))?;
+
+        // Find the accessor, if the type has one with the same label
+        let RecordAccessor {
+            index, label, typ, ..
+        } = accessors
+            .accessors
+            .get(&label)
+            .ok_or_else(|| {
+                unknown_field(accessors.accessors.keys().map(|t| t.to_string()).collect())
+            })?
+            .clone();
+
+        // Unify the record type with the accessor's stored copy of the record type.
+        // This ensure that the type parameters of the retrieved value have the correct
+        // types for this instance of the record.
+        let accessor_record_type = accessors.typ.clone();
+        let mut type_vars = hashmap![];
+        let accessor_record_type = self
+            .typer
+            .instantiate(accessor_record_type, 0, &mut type_vars);
+        let typ = self.typer.instantiate(typ, 0, &mut type_vars);
+        unify(accessor_record_type, record.typ())
+            .map_err(|e| convert_unify_error(e, record.location()))?;
+
+        Ok(TypedExpr::RecordAccess {
+            record,
+            label,
+            index,
+            location,
+            typ,
+        })
+    }
+
+    fn do_infer_call(
+        &mut self,
+        fun: UntypedExpr,
+        args: Vec<CallArg<UntypedExpr>>,
+        level: usize,
+        location: &SrcSpan,
+    ) -> Result<(TypedExpr, Vec<TypedCallArg>, Arc<Type>), Error> {
+        let fun = self.infer(fun, level)?;
+        let (fun, args, typ) = self.do_infer_call_with_known_fun(fun, args, level, location)?;
+        Ok((fun, args, typ))
+    }
+
+    fn do_infer_call_with_known_fun(
+        &mut self,
+        fun: TypedExpr,
+        mut args: Vec<CallArg<UntypedExpr>>,
+        level: usize,
+        location: &SrcSpan,
+    ) -> Result<(TypedExpr, Vec<TypedCallArg>, Arc<Type>), Error> {
+        match get_field_map(&fun, self.typer)
+            .map_err(|e| convert_get_value_constructor_error(e, location))?
+        {
+            // The fun has a field map so labelled arguments may be present and need to be reordered.
+            Some(field_map) => field_map.reorder(&mut args, location)?,
+
+            // The fun has no field map and so we error if arguments have been labelled
+            None => assert_no_labelled_arguments(&args)?,
+        }
+
+        let (mut args_types, return_type) = self
+            .typer
+            .match_fun_type(fun.typ(), args.len())
+            .map_err(|e| convert_not_fun_error(e, fun.location(), &location))?;
+        let args = args_types
+            .iter_mut()
+            .zip(args)
+            .map(
+                |(
+                    typ,
+                    CallArg {
+                        label,
+                        value,
+                        location,
+                    },
+                ): (&mut Arc<Type>, _)| {
+                    let value = self.infer(value, level)?;
+                    unify(typ.clone(), value.typ())
+                        .map_err(|e| convert_unify_error(e, value.location()))?;
+                    Ok(CallArg {
+                        label,
+                        value,
+                        location,
+                    })
+                },
+            )
+            .collect::<Result<_, _>>()?;
+        Ok((fun, args, return_type))
+    }
+
+    fn infer_value_constructor(
+        &mut self,
+        name: &str,
+        level: usize,
+        location: &SrcSpan,
+    ) -> Result<ValueConstructor, Error> {
+        let ValueConstructor {
+            public,
+            variant,
+            origin,
+            typ,
+        } = self
+            .typer
+            .get_variable(name)
+            .cloned()
+            .ok_or_else(|| Error::UnknownVariable {
+                location: location.clone(),
+                name: name.to_string(),
+                variables: self
+                    .typer
+                    .local_values
+                    .keys()
+                    .map(|t| t.to_string())
+                    .collect(),
+            })?;
+        let typ = self.typer.instantiate(typ, level, &mut hashmap![]);
+        Ok(ValueConstructor {
+            public,
+            variant,
+            origin,
+            typ,
+        })
+    }
+
+    fn infer_arg(
+        &mut self,
+        arg: UntypedArg,
+        type_vars: &mut im::HashMap<String, (usize, Arc<Type>)>,
+        level: usize,
+    ) -> Result<TypedArg, Error> {
+        let Arg {
+            names,
+            annotation,
+            location,
+            ..
+        } = arg;
+        let typ = annotation
+            .clone()
+            .map(|t| {
+                self.typer
+                    .type_from_ast(&t, type_vars, NewTypeAction::MakeGeneric)
+            })
+            .unwrap_or_else(|| Ok(self.typer.new_unbound_var(level)))?;
+        Ok(Arg {
+            names,
+            location,
+            annotation,
+            typ,
+        })
+    }
+
+    fn infer_var(
+        &mut self,
+        name: String,
+        location: SrcSpan,
+        level: usize,
+    ) -> Result<TypedExpr, Error> {
+        let constructor = self.infer_value_constructor(&name, level, &location)?;
+        Ok(TypedExpr::Var {
+            constructor,
+            location,
+            name,
+        })
+    }
+
+    fn infer_field_access(
+        &mut self,
+        container: UntypedExpr,
+        label: String,
+        access_location: SrcSpan,
+        level: usize,
+    ) -> Result<TypedExpr, Error> {
+        match container {
+            UntypedExpr::Var { name, location, .. }
+                if !self.typer.local_values.contains_key(&name) =>
+            {
+                self.infer_module_access(name.as_ref(), label, level, &location, access_location)
+            }
+
+            _ => self.infer_record_access(container, label, level, access_location),
+        }
+    }
+
+    fn infer_pipe(
+        &mut self,
+        left: UntypedExpr,
+        right: UntypedExpr,
+        location: SrcSpan,
+        level: usize,
+    ) -> Result<TypedExpr, Error> {
+        match right {
+            // left |> right(..args)
+            UntypedExpr::Call { fun, args, .. } => {
+                let fun = self.infer(*fun, level)?;
+                match fun.typ().fn_arity() {
+                    // Rewrite as right(left, ..args)
+                    Some(arity) if arity == args.len() + 1 => {
+                        self.infer_insert_pipe(fun, args, left, level)
+                    }
+
+                    // Rewrite as right(..args)(left)
+                    _ => self.infer_apply_to_call_pipe(fun, args, left, location, level),
+                }
+            }
+
+            // right(left)
+            right => self.infer_apply_pipe(left, right, location, level),
+        }
+    }
+
+    /// Attempt to infer a |> b(..c) as b(..c)(a)
+    fn infer_apply_to_call_pipe(
+        &mut self,
+        fun: TypedExpr,
+        args: Vec<CallArg<UntypedExpr>>,
+        left: UntypedExpr,
+        location: SrcSpan,
+        level: usize,
+    ) -> Result<TypedExpr, Error> {
+        let right_location = left.location().clone();
+        let (fun, args, typ) =
+            self.do_infer_call_with_known_fun(fun, args, level, &right_location)?;
+        let fun = TypedExpr::Call {
+            location: right_location,
+            typ,
+            args,
+            fun: Box::new(fun),
+        };
+        let args = vec![CallArg {
+            label: None,
+            location: left.location().clone(),
+            value: left,
+        }];
+        let (fun, args, typ) = self.do_infer_call_with_known_fun(fun, args, level, &location)?;
+        Ok(TypedExpr::Call {
+            location,
+            typ,
+            args,
+            fun: Box::new(fun),
+        })
+    }
+
+    /// Attempt to infer a |> b(c) as b(a, c)
+    fn infer_insert_pipe(
+        &mut self,
+        fun: TypedExpr,
+        args: Vec<CallArg<UntypedExpr>>,
+        left: UntypedExpr,
+        level: usize,
+    ) -> Result<TypedExpr, Error> {
+        let location = left.location().clone();
+        let mut new_args = Vec::with_capacity(args.len() + 1);
+        new_args.push(CallArg {
+            label: None,
+            location: left.location().clone(),
+            value: left,
+        });
+        for arg in args {
+            new_args.push(arg.clone());
+        }
+        let (fun, args, typ) =
+            self.do_infer_call_with_known_fun(fun, new_args, level, &location)?;
+        Ok(TypedExpr::Call {
+            location,
+            typ,
+            args,
+            fun: Box::new(fun),
+        })
+    }
+
+    /// Attempt to infer a |> b as b(a)
+    fn infer_apply_pipe(
+        &mut self,
+        left: UntypedExpr,
+        right: UntypedExpr,
+        location: SrcSpan,
+        level: usize,
+    ) -> Result<TypedExpr, Error> {
+        let left = Box::new(self.infer(left, level)?);
+        let right = Box::new(self.infer(right, level)?);
+        let typ = self.typer.new_unbound_var(level);
+        let fn_typ = Arc::new(Type::Fn {
+            args: vec![left.typ()],
+            retrn: typ.clone(),
+        });
+        unify(right.typ(), fn_typ).map_err(|e| convert_unify_error(e, &location))?;
+
+        Ok(TypedExpr::Pipe {
+            location,
+            typ,
+            right,
+            left,
+        })
     }
 }
 
@@ -3493,7 +3492,7 @@ fn unify_enclosed_type(
         _ => result,
     }
 }
-fn unify(t1: Arc<Type>, t2: Arc<Type>, typer: &ModuleTyper) -> Result<(), UnifyError> {
+fn unify(t1: Arc<Type>, t2: Arc<Type>) -> Result<(), UnifyError> {
     if t1 == t2 {
         return Ok(());
     }
@@ -3501,7 +3500,7 @@ fn unify(t1: Arc<Type>, t2: Arc<Type>, typer: &ModuleTyper) -> Result<(), UnifyE
     // Collapse right hand side type links. Left hand side will be collapsed in the next block.
     if let Type::Var { typ } = &*t2 {
         if let TypeVar::Link { typ } = &*typ.borrow() {
-            return unify(t1, typ.clone(), typer);
+            return unify(t1, typ.clone());
         }
     }
 
@@ -3537,7 +3536,7 @@ fn unify(t1: Arc<Type>, t2: Arc<Type>, typer: &ModuleTyper) -> Result<(), UnifyE
                 Ok(())
             }
 
-            Action::Unify(t) => unify(t, t2, typer),
+            Action::Unify(t) => unify(t, t2),
 
             Action::CouldNotUnify => Err(UnifyError::CouldNotUnify {
                 expected: t1.clone(),
@@ -3547,7 +3546,7 @@ fn unify(t1: Arc<Type>, t2: Arc<Type>, typer: &ModuleTyper) -> Result<(), UnifyE
     }
 
     if let Type::Var { .. } = *t2 {
-        return unify(t2, t1, typer).map_err(flip_unify_error);
+        return unify(t2, t1).map_err(flip_unify_error);
     }
 
     match (&*t1, &*t2) {
@@ -3566,7 +3565,7 @@ fn unify(t1: Arc<Type>, t2: Arc<Type>, typer: &ModuleTyper) -> Result<(), UnifyE
             },
         ) if m1 == m2 && n1 == n2 && args1.len() == args2.len() => {
             for (a, b) in args1.iter().zip(args2) {
-                unify_enclosed_type(t1.clone(), t2.clone(), unify(a.clone(), b.clone(), typer))?;
+                unify_enclosed_type(t1.clone(), t2.clone(), unify(a.clone(), b.clone()))?;
             }
             Ok(())
         }
@@ -3575,7 +3574,7 @@ fn unify(t1: Arc<Type>, t2: Arc<Type>, typer: &ModuleTyper) -> Result<(), UnifyE
             if elems1.len() == elems2.len() =>
         {
             for (a, b) in elems1.iter().zip(elems2) {
-                unify_enclosed_type(t1.clone(), t2.clone(), unify(a.clone(), b.clone(), typer))?;
+                unify_enclosed_type(t1.clone(), t2.clone(), unify(a.clone(), b.clone()))?;
             }
             Ok(())
         }
@@ -3593,12 +3592,12 @@ fn unify(t1: Arc<Type>, t2: Arc<Type>, typer: &ModuleTyper) -> Result<(), UnifyE
             },
         ) if args1.len() == args2.len() => {
             for (a, b) in args1.iter().zip(args2) {
-                unify(a.clone(), b.clone(), typer).map_err(|_| UnifyError::CouldNotUnify {
+                unify(a.clone(), b.clone()).map_err(|_| UnifyError::CouldNotUnify {
                     expected: t1.clone(),
                     given: t2.clone(),
                 })?;
             }
-            unify(retrn1.clone(), retrn2.clone(), typer).map_err(|_| UnifyError::CouldNotUnify {
+            unify(retrn1.clone(), retrn2.clone()).map_err(|_| UnifyError::CouldNotUnify {
                 expected: t1.clone(),
                 given: t2.clone(),
             })
