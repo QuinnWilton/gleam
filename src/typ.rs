@@ -2178,23 +2178,23 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
     /// Crawl the AST, annotating each node with the inferred type or
     /// returning an error.
     ///
-    pub fn infer(&mut self, expr: UntypedExpr, level: usize) -> Result<TypedExpr, Error> {
+    pub fn infer(&mut self, expr: UntypedExpr) -> Result<TypedExpr, Error> {
         match expr {
-            UntypedExpr::ListNil { location, .. } => self.infer_nil(location, level),
+            UntypedExpr::ListNil { location, .. } => self.infer_nil(location),
 
-            UntypedExpr::Todo { location, .. } => self.infer_todo(location, level),
+            UntypedExpr::Todo { location, .. } => self.infer_todo(location),
 
-            UntypedExpr::Var { location, name, .. } => self.infer_var(name, location, level),
+            UntypedExpr::Var { location, name, .. } => self.infer_var(name, location),
 
             UntypedExpr::Int {
                 location, value, ..
             } => self.infer_int(value, location),
 
-            UntypedExpr::Seq { first, then, .. } => self.infer_seq(*first, *then, level),
+            UntypedExpr::Seq { first, then, .. } => self.infer_seq(*first, *then),
 
             UntypedExpr::Tuple {
                 location, elems, ..
-            } => self.infer_tuple(elems, location, level),
+            } => self.infer_tuple(elems, location),
 
             UntypedExpr::Float {
                 location, value, ..
@@ -2208,7 +2208,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 left,
                 right,
                 location,
-            } => self.infer_pipe(*left, *right, location, level),
+            } => self.infer_pipe(*left, *right, location),
 
             UntypedExpr::Fn {
                 location,
@@ -2217,7 +2217,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 body,
                 return_annotation,
                 ..
-            } => self.infer_fn(args, *body, is_capture, return_annotation, level, location),
+            } => self.infer_fn(args, *body, is_capture, return_annotation, location),
 
             UntypedExpr::Let {
                 location,
@@ -2227,14 +2227,14 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 kind,
                 annotation,
                 ..
-            } => self.infer_let(pattern, *value, *then, kind, &annotation, level, location),
+            } => self.infer_let(pattern, *value, *then, kind, &annotation, location),
 
             UntypedExpr::Case {
                 location,
                 subjects,
                 clauses,
                 ..
-            } => self.infer_case(subjects, clauses, level, location),
+            } => self.infer_case(subjects, clauses, location),
 
             UntypedExpr::ListCons {
                 location,
@@ -2242,14 +2242,14 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 tail,
                 deprecated_syntax,
                 ..
-            } => self.infer_cons(*head, *tail, deprecated_syntax, location, level),
+            } => self.infer_cons(*head, *tail, deprecated_syntax, location),
 
             UntypedExpr::Call {
                 location,
                 fun,
                 args,
                 ..
-            } => self.infer_call(*fun, args, level, location),
+            } => self.infer_call(*fun, args, location),
 
             UntypedExpr::BinOp {
                 location,
@@ -2257,21 +2257,21 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 left,
                 right,
                 ..
-            } => self.infer_binop(name, *left, *right, level, location),
+            } => self.infer_binop(name, *left, *right, location),
 
             UntypedExpr::FieldAccess {
                 location,
                 label,
                 container,
                 ..
-            } => self.infer_field_access(*container, label, location, level),
+            } => self.infer_field_access(*container, label, location),
 
             UntypedExpr::TupleIndex {
                 location,
                 index,
                 tuple,
                 ..
-            } => self.infer_tuple_index(*tuple, index, location, level),
+            } => self.infer_tuple_index(*tuple, index, location),
         }
     }
 
@@ -2286,7 +2286,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         let mut type_vars = hashmap![];
         let args: Vec<_> = args
             .into_iter()
-            .map(|arg| self.infer_arg(arg, &mut type_vars, self.level))
+            .map(|arg| self.infer_arg(arg, &mut type_vars))
             .collect::<Result<_, _>>()?;
 
         // Record generic type variables that comes from type annotations.
@@ -2307,7 +2307,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
             };
         }
 
-        let body = self.infer(body, self.level)?;
+        let body = self.infer(body)?;
 
         // Check that any return type annotation is accurate.
         if let Some(ann) = return_annotation {
@@ -2323,21 +2323,21 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         Ok((args, body))
     }
 
-    fn infer_nil(&mut self, location: SrcSpan, level: usize) -> Result<TypedExpr, Error> {
+    fn infer_nil(&mut self, location: SrcSpan) -> Result<TypedExpr, Error> {
         Ok(TypedExpr::ListNil {
             location,
-            typ: list(self.typer.new_unbound_var(level)),
+            typ: list(self.typer.new_unbound_var(self.level)),
         })
     }
 
-    fn infer_todo(&mut self, location: SrcSpan, level: usize) -> Result<TypedExpr, Error> {
+    fn infer_todo(&mut self, location: SrcSpan) -> Result<TypedExpr, Error> {
         self.typer.warnings.push(Warning::Todo {
             location: location.clone(),
         });
 
         Ok(TypedExpr::Todo {
             location,
-            typ: self.typer.new_unbound_var(level),
+            typ: self.typer.new_unbound_var(self.level),
         })
     }
 
@@ -2365,14 +2365,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         })
     }
 
-    fn infer_seq(
-        &mut self,
-        first: UntypedExpr,
-        then: UntypedExpr,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        let first = self.infer(first, level)?;
-        let then = self.infer(then, level)?;
+    fn infer_seq(&mut self, first: UntypedExpr, then: UntypedExpr) -> Result<TypedExpr, Error> {
+        let first = self.infer(first)?;
+        let then = self.infer(then)?;
 
         match first.typ().as_ref() {
             typ if typ.is_result() => {
@@ -2399,10 +2394,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         body: UntypedExpr,
         is_capture: bool,
         return_annotation: Option<TypeAst>,
-        level: usize,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
-        let mut expr_typer = ExprTyper::new(self.typer, level);
+        let mut expr_typer = ExprTyper::new(self.typer, self.level);
         let (args, body) = expr_typer.do_infer_fn(args, body, &return_annotation)?;
         let args_types = args.iter().map(|a| a.typ.clone()).collect();
         let typ = fn_(args_types, body.typ());
@@ -2420,10 +2414,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         &mut self,
         fun: UntypedExpr,
         args: Vec<CallArg<UntypedExpr>>,
-        level: usize,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
-        let (fun, args, typ) = self.do_infer_call(fun, args, level, &location)?;
+        let (fun, args, typ) = self.do_infer_call(fun, args, &location)?;
         Ok(TypedExpr::Call {
             location,
             typ,
@@ -2438,10 +2431,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         tail: UntypedExpr,
         deprecated_syntax: bool,
         location: SrcSpan,
-        level: usize,
     ) -> Result<TypedExpr, Error> {
-        let head = self.infer(head, level)?;
-        let tail = self.infer(tail, level)?;
+        let head = self.infer(head)?;
+        let tail = self.infer(tail)?;
         unify(tail.typ(), list(head.typ())).map_err(|e| convert_unify_error(e, &location))?;
 
         if deprecated_syntax {
@@ -2467,11 +2459,10 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         &mut self,
         elems: Vec<UntypedExpr>,
         location: SrcSpan,
-        level: usize,
     ) -> Result<TypedExpr, Error> {
         let elems = elems
             .into_iter()
-            .map(|e| self.infer(e, level))
+            .map(|e| self.infer(e))
             .collect::<Result<Vec<_>, _>>()?;
         let typ = tuple(elems.iter().map(|e| e.typ()).collect());
         Ok(TypedExpr::Tuple {
@@ -2486,9 +2477,8 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         tuple: UntypedExpr,
         index: u64,
         location: SrcSpan,
-        level: usize,
     ) -> Result<TypedExpr, Error> {
-        let tuple = self.infer(tuple, level)?;
+        let tuple = self.infer(tuple)?;
 
         match tuple.typ().as_ref() {
             Type::Tuple { elems } => {
@@ -2524,13 +2514,12 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         name: BinOp,
         left: UntypedExpr,
         right: UntypedExpr,
-        level: usize,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
         let (input_type, output_type) = match name {
             BinOp::Eq | BinOp::NotEq => {
-                let left = self.infer(left, level)?;
-                let right = self.infer(right, level)?;
+                let left = self.infer(left)?;
+                let right = self.infer(right)?;
                 unify(left.typ(), right.typ())
                     .map_err(|e| convert_unify_error(e, right.location()))?;
 
@@ -2563,10 +2552,10 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
             BinOp::ModuloInt => (int(), int()),
         };
 
-        let left = self.infer(left, level)?;
+        let left = self.infer(left)?;
         unify(input_type.clone(), left.typ())
             .map_err(|e| convert_unify_error(e, left.location()))?;
-        let right = self.infer(right, level)?;
+        let right = self.infer(right)?;
         unify(input_type, right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
 
         Ok(TypedExpr::BinOp {
@@ -2585,12 +2574,12 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         then: UntypedExpr,
         kind: BindingKind,
         annotation: &Option<TypeAst>,
-        level: usize,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
-        let value = self.infer(value, level + 1)?;
-        let try_value_type = self.typer.new_unbound_var(level);
-        let try_error_type = self.typer.new_unbound_var(level);
+        let mut val_typer = ExprTyper::new(self.typer, self.level + 1);
+        let value = val_typer.infer(value)?;
+        let try_value_type = self.typer.new_unbound_var(self.level);
+        let try_error_type = self.typer.new_unbound_var(self.level);
 
         let value_typ = match kind {
             // Ensure that the value is a result if this is a `try` binding
@@ -2604,18 +2593,19 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
             _ => value.typ(),
         };
 
-        let value_typ = generalise(value_typ, level + 1);
+        let value_typ = generalise(value_typ, self.level + 1);
 
         // Ensure the pattern matches the type of the value
-        let pattern = PatternTyper::new(self.typer, level).unify(pattern, value_typ.clone())?;
+        let pattern =
+            PatternTyper::new(self.typer, self.level).unify(pattern, value_typ.clone())?;
 
         // Check the type of the following code
-        let then = self.infer(then, level)?;
+        let then = self.infer(then)?;
         let typ = then.typ();
 
         // Ensure that a Result with the right error type is returned for `try`
         if kind == BindingKind::Try {
-            let value = self.typer.new_unbound_var(level);
+            let value = self.typer.new_unbound_var(self.level);
             unify(result(value, try_error_type), typ.clone())
                 .map_err(|e| convert_unify_error(e, then.try_binding_location()))?;
         }
@@ -2625,7 +2615,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
             let ann_typ = self
                 .typer
                 .type_from_ast(ann, &mut hashmap![], NewTypeAction::MakeGeneric)
-                .map(|t| self.typer.instantiate(t, level, &mut hashmap![]))?;
+                .map(|t| self.typer.instantiate(t, self.level, &mut hashmap![]))?;
             unify(ann_typ, value_typ).map_err(|e| convert_unify_error(e, value.location()))?;
         }
 
@@ -2643,7 +2633,6 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         &mut self,
         subjects: Vec<UntypedExpr>,
         clauses: Vec<UntypedClause>,
-        level: usize,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
         let subjects_count = subjects.len();
@@ -2651,17 +2640,18 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         let mut subject_types = Vec::with_capacity(subjects_count);
         let mut typed_clauses = Vec::with_capacity(clauses.len());
 
-        let return_type = self.typer.new_unbound_var(level);
+        let return_type = self.typer.new_unbound_var(self.level);
 
         for subject in subjects.into_iter() {
-            let subject = self.infer(subject, level + 1)?;
-            let subject_type = generalise(subject.typ(), level + 1);
+            let mut subject_typer = ExprTyper::new(self.typer, self.level + 1);
+            let subject = subject_typer.infer(subject)?;
+            let subject_type = generalise(subject.typ(), self.level + 1);
             typed_subjects.push(subject);
             subject_types.push(subject_type);
         }
 
         for clause in clauses.into_iter() {
-            let typed_clause = self.infer_clause(clause, &subject_types, level)?;
+            let typed_clause = self.infer_clause(clause, &subject_types)?;
             unify(return_type.clone(), typed_clause.then.typ())
                 .map_err(|e| convert_unify_error(e, typed_clause.then.location()))?;
             typed_clauses.push(typed_clause);
@@ -2678,7 +2668,6 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         &mut self,
         clause: UntypedClause,
         subjects: &[Arc<Type>],
-        level: usize,
     ) -> Result<TypedClause, Error> {
         let Clause {
             pattern,
@@ -2693,9 +2682,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
 
         // Check the types
         let (typed_pattern, typed_alternatives) =
-            self.infer_clause_pattern(pattern, alternative_patterns, subjects, level, &location)?;
-        let guard = self.infer_optional_clause_guard(guard, level)?;
-        let then = self.infer(then, level)?;
+            self.infer_clause_pattern(pattern, alternative_patterns, subjects, &location)?;
+        let guard = self.infer_optional_clause_guard(guard)?;
+        let then = self.infer(then)?;
 
         // Reset the local vars now the clause scope is done
         self.typer.local_values = vars;
@@ -2714,10 +2703,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         pattern: UntypedMultiPattern,
         alternatives: Vec<UntypedMultiPattern>,
         subjects: &[Arc<Type>],
-        level: usize,
         location: &SrcSpan,
     ) -> Result<(TypedMultiPattern, Vec<TypedMultiPattern>), Error> {
-        let mut pattern_typer = PatternTyper::new(self.typer, level);
+        let mut pattern_typer = PatternTyper::new(self.typer, self.level);
         let typed_pattern = pattern_typer.infer_multi_pattern(pattern, subjects, &location)?;
 
         // Each case clause has one or more patterns that may match the
@@ -2735,7 +2723,6 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
     fn infer_optional_clause_guard(
         &mut self,
         guard: Option<UntypedClauseGuard>,
-        level: usize,
     ) -> Result<Option<TypedClauseGuard>, Error> {
         match guard {
             // If there is no guard we do nothing
@@ -2743,21 +2730,17 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
 
             // If there is a guard we assert that it is of type Bool
             Some(guard) => {
-                let guard = self.infer_clause_guard(guard, level)?;
+                let guard = self.infer_clause_guard(guard)?;
                 unify(bool(), guard.typ()).map_err(|e| convert_unify_error(e, guard.location()))?;
                 Ok(Some(guard))
             }
         }
     }
 
-    fn infer_clause_guard(
-        &mut self,
-        guard: UntypedClauseGuard,
-        level: usize,
-    ) -> Result<TypedClauseGuard, Error> {
+    fn infer_clause_guard(&mut self, guard: UntypedClauseGuard) -> Result<TypedClauseGuard, Error> {
         match guard {
             ClauseGuard::Var { location, name, .. } => {
-                let constructor = self.infer_value_constructor(&name, level, &location)?;
+                let constructor = self.infer_value_constructor(&name, &location)?;
 
                 // We cannot support all values in guard expressions as the BEAM does not
                 match &constructor.variant {
@@ -2780,7 +2763,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
             } => {
                 let elems = elems
                     .into_iter()
-                    .map(|x| self.infer_clause_guard(x, level))
+                    .map(|x| self.infer_clause_guard(x))
                     .collect::<Result<Vec<_>, _>>()?;
 
                 let typ = tuple(elems.iter().map(|e| e.typ()).collect());
@@ -2798,9 +2781,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
+                let left = self.infer_clause_guard(*left)?;
                 unify(bool(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(bool(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
                 Ok(ClauseGuard::And {
                     location,
@@ -2815,9 +2798,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
+                let left = self.infer_clause_guard(*left)?;
                 unify(bool(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(bool(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
                 Ok(ClauseGuard::Or {
                     location,
@@ -2832,8 +2815,8 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let left = self.infer_clause_guard(*left)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(left.typ(), right.typ()).map_err(|e| convert_unify_error(e, &location))?;
                 Ok(ClauseGuard::Equals {
                     location,
@@ -2848,8 +2831,8 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let left = self.infer_clause_guard(*left)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(left.typ(), right.typ()).map_err(|e| convert_unify_error(e, &location))?;
                 Ok(ClauseGuard::NotEquals {
                     location,
@@ -2864,9 +2847,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
+                let left = self.infer_clause_guard(*left)?;
                 unify(int(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(int(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
                 Ok(ClauseGuard::GtInt {
                     location,
@@ -2881,9 +2864,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
+                let left = self.infer_clause_guard(*left)?;
                 unify(int(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(int(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
                 Ok(ClauseGuard::GtEqInt {
                     location,
@@ -2898,9 +2881,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
+                let left = self.infer_clause_guard(*left)?;
                 unify(int(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(int(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
                 Ok(ClauseGuard::LtInt {
                     location,
@@ -2915,9 +2898,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
+                let left = self.infer_clause_guard(*left)?;
                 unify(int(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(int(), right.typ()).map_err(|e| convert_unify_error(e, right.location()))?;
                 Ok(ClauseGuard::LtEqInt {
                     location,
@@ -2932,9 +2915,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
+                let left = self.infer_clause_guard(*left)?;
                 unify(float(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(float(), right.typ())
                     .map_err(|e| convert_unify_error(e, right.location()))?;
                 Ok(ClauseGuard::GtFloat {
@@ -2950,9 +2933,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
+                let left = self.infer_clause_guard(*left)?;
                 unify(float(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(float(), right.typ())
                     .map_err(|e| convert_unify_error(e, right.location()))?;
                 Ok(ClauseGuard::GtEqFloat {
@@ -2968,9 +2951,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
+                let left = self.infer_clause_guard(*left)?;
                 unify(float(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(float(), right.typ())
                     .map_err(|e| convert_unify_error(e, right.location()))?;
                 Ok(ClauseGuard::LtFloat {
@@ -2986,9 +2969,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 right,
                 ..
             } => {
-                let left = self.infer_clause_guard(*left, level)?;
+                let left = self.infer_clause_guard(*left)?;
                 unify(float(), left.typ()).map_err(|e| convert_unify_error(e, left.location()))?;
-                let right = self.infer_clause_guard(*right, level)?;
+                let right = self.infer_clause_guard(*right)?;
                 unify(float(), right.typ())
                     .map_err(|e| convert_unify_error(e, right.location()))?;
                 Ok(ClauseGuard::LtEqFloat {
@@ -3012,7 +2995,6 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         &mut self,
         module_alias: &str,
         label: String,
-        level: usize,
         module_location: &SrcSpan,
         select_location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
@@ -3054,7 +3036,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
             label,
             typ: self
                 .typer
-                .instantiate(constructor.typ, level, &mut hashmap![]),
+                .instantiate(constructor.typ, self.level, &mut hashmap![]),
             location: select_location,
             module_name,
             module_alias: module_alias.to_string(),
@@ -3066,11 +3048,10 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         &mut self,
         record: UntypedExpr,
         label: String,
-        level: usize,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
         // Infer the type of the (presumed) record
-        let record = Box::new(self.infer(record, level)?);
+        let record = Box::new(self.infer(record)?);
 
         // If we don't yet know the type of the record then we cannot use any accessors
         if record.typ().is_unbound() {
@@ -3141,11 +3122,10 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         &mut self,
         fun: UntypedExpr,
         args: Vec<CallArg<UntypedExpr>>,
-        level: usize,
         location: &SrcSpan,
     ) -> Result<(TypedExpr, Vec<TypedCallArg>, Arc<Type>), Error> {
-        let fun = self.infer(fun, level)?;
-        let (fun, args, typ) = self.do_infer_call_with_known_fun(fun, args, level, location)?;
+        let fun = self.infer(fun)?;
+        let (fun, args, typ) = self.do_infer_call_with_known_fun(fun, args, location)?;
         Ok((fun, args, typ))
     }
 
@@ -3153,7 +3133,6 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         &mut self,
         fun: TypedExpr,
         mut args: Vec<CallArg<UntypedExpr>>,
-        level: usize,
         location: &SrcSpan,
     ) -> Result<(TypedExpr, Vec<TypedCallArg>, Arc<Type>), Error> {
         match get_field_map(&fun, self.typer)
@@ -3182,7 +3161,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                         location,
                     },
                 ): (&mut Arc<Type>, _)| {
-                    let value = self.infer(value, level)?;
+                    let value = self.infer(value)?;
                     unify(typ.clone(), value.typ())
                         .map_err(|e| convert_unify_error(e, value.location()))?;
                     Ok(CallArg {
@@ -3199,7 +3178,6 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
     fn infer_value_constructor(
         &mut self,
         name: &str,
-        level: usize,
         location: &SrcSpan,
     ) -> Result<ValueConstructor, Error> {
         let ValueConstructor {
@@ -3221,7 +3199,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                     .map(|t| t.to_string())
                     .collect(),
             })?;
-        let typ = self.typer.instantiate(typ, level, &mut hashmap![]);
+        let typ = self.typer.instantiate(typ, self.level, &mut hashmap![]);
         Ok(ValueConstructor {
             public,
             variant,
@@ -3234,7 +3212,6 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         &mut self,
         arg: UntypedArg,
         type_vars: &mut im::HashMap<String, (usize, Arc<Type>)>,
-        level: usize,
     ) -> Result<TypedArg, Error> {
         let Arg {
             names,
@@ -3248,7 +3225,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
                 self.typer
                     .type_from_ast(&t, type_vars, NewTypeAction::MakeGeneric)
             })
-            .unwrap_or_else(|| Ok(self.typer.new_unbound_var(level)))?;
+            .unwrap_or_else(|| Ok(self.typer.new_unbound_var(self.level)))?;
         Ok(Arg {
             names,
             location,
@@ -3257,13 +3234,8 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         })
     }
 
-    fn infer_var(
-        &mut self,
-        name: String,
-        location: SrcSpan,
-        level: usize,
-    ) -> Result<TypedExpr, Error> {
-        let constructor = self.infer_value_constructor(&name, level, &location)?;
+    fn infer_var(&mut self, name: String, location: SrcSpan) -> Result<TypedExpr, Error> {
+        let constructor = self.infer_value_constructor(&name, &location)?;
         Ok(TypedExpr::Var {
             constructor,
             location,
@@ -3276,16 +3248,15 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         container: UntypedExpr,
         label: String,
         access_location: SrcSpan,
-        level: usize,
     ) -> Result<TypedExpr, Error> {
         match container {
             UntypedExpr::Var { name, location, .. }
                 if !self.typer.local_values.contains_key(&name) =>
             {
-                self.infer_module_access(name.as_ref(), label, level, &location, access_location)
+                self.infer_module_access(name.as_ref(), label, &location, access_location)
             }
 
-            _ => self.infer_record_access(container, label, level, access_location),
+            _ => self.infer_record_access(container, label, access_location),
         }
     }
 
@@ -3294,25 +3265,24 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         left: UntypedExpr,
         right: UntypedExpr,
         location: SrcSpan,
-        level: usize,
     ) -> Result<TypedExpr, Error> {
         match right {
             // left |> right(..args)
             UntypedExpr::Call { fun, args, .. } => {
-                let fun = self.infer(*fun, level)?;
+                let fun = self.infer(*fun)?;
                 match fun.typ().fn_arity() {
                     // Rewrite as right(left, ..args)
                     Some(arity) if arity == args.len() + 1 => {
-                        self.infer_insert_pipe(fun, args, left, level)
+                        self.infer_insert_pipe(fun, args, left)
                     }
 
                     // Rewrite as right(..args)(left)
-                    _ => self.infer_apply_to_call_pipe(fun, args, left, location, level),
+                    _ => self.infer_apply_to_call_pipe(fun, args, left, location),
                 }
             }
 
             // right(left)
-            right => self.infer_apply_pipe(left, right, location, level),
+            right => self.infer_apply_pipe(left, right, location),
         }
     }
 
@@ -3323,11 +3293,9 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         args: Vec<CallArg<UntypedExpr>>,
         left: UntypedExpr,
         location: SrcSpan,
-        level: usize,
     ) -> Result<TypedExpr, Error> {
         let right_location = left.location().clone();
-        let (fun, args, typ) =
-            self.do_infer_call_with_known_fun(fun, args, level, &right_location)?;
+        let (fun, args, typ) = self.do_infer_call_with_known_fun(fun, args, &right_location)?;
         let fun = TypedExpr::Call {
             location: right_location,
             typ,
@@ -3339,7 +3307,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
             location: left.location().clone(),
             value: left,
         }];
-        let (fun, args, typ) = self.do_infer_call_with_known_fun(fun, args, level, &location)?;
+        let (fun, args, typ) = self.do_infer_call_with_known_fun(fun, args, &location)?;
         Ok(TypedExpr::Call {
             location,
             typ,
@@ -3354,7 +3322,6 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         fun: TypedExpr,
         args: Vec<CallArg<UntypedExpr>>,
         left: UntypedExpr,
-        level: usize,
     ) -> Result<TypedExpr, Error> {
         let location = left.location().clone();
         let mut new_args = Vec::with_capacity(args.len() + 1);
@@ -3366,8 +3333,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         for arg in args {
             new_args.push(arg.clone());
         }
-        let (fun, args, typ) =
-            self.do_infer_call_with_known_fun(fun, new_args, level, &location)?;
+        let (fun, args, typ) = self.do_infer_call_with_known_fun(fun, new_args, &location)?;
         Ok(TypedExpr::Call {
             location,
             typ,
@@ -3382,11 +3348,10 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         left: UntypedExpr,
         right: UntypedExpr,
         location: SrcSpan,
-        level: usize,
     ) -> Result<TypedExpr, Error> {
-        let left = Box::new(self.infer(left, level)?);
-        let right = Box::new(self.infer(right, level)?);
-        let typ = self.typer.new_unbound_var(level);
+        let left = Box::new(self.infer(left)?);
+        let right = Box::new(self.infer(right)?);
+        let typ = self.typer.new_unbound_var(self.level);
         let fn_typ = Arc::new(Type::Fn {
             args: vec![left.typ()],
             retrn: typ.clone(),

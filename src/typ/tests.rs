@@ -196,7 +196,7 @@ fn infer_test() {
             let importable_modules = HashMap::new();
             let mut typer = ModuleTyper::new(&[], &importable_modules);
             let mut expr_typer = ExprTyper::new(&mut typer, 1);
-            let result = expr_typer.infer(ast, 1).expect("should successfully infer");
+            let result = expr_typer.infer(ast).expect("should successfully infer");
             assert_eq!(
                 ($src, printer.pretty_print(result.typ().as_ref(), 0),),
                 ($src, $typ.to_string()),
@@ -426,7 +426,7 @@ fn infer_error_test() {
             let importable_modules = HashMap::new();
             let mut typer = ModuleTyper::new(&[], &importable_modules);
             let mut expr_typer = ExprTyper::new(&mut typer, 1);
-            let result = expr_typer.infer(ast, 1).expect_err("should infer an error");
+            let result = expr_typer.infer(ast).expect_err("should infer an error");
             assert_eq!(($src, sort_options($error)), ($src, sort_options(result)));
         };
     }
