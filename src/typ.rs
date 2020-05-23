@@ -1500,7 +1500,7 @@ pub fn infer_module(
                     },
                 )?;
 
-                // Insert the function into the typerironment
+                // Insert the function into the environment
                 typer.insert_variable(
                     name.clone(),
                     ValueConstructorVariant::ModuleFn {
