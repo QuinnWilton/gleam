@@ -1475,8 +1475,8 @@ pub fn infer_module(
                 );
 
                 // Infer the type
-                let mut fn_typer = FnTyper::new(&mut typer, level + 1);
-                let (args, body) = fn_typer.do_infer_fn(args, body, &return_annotation)?;
+                let mut expr_typer = ExprTyper::new(&mut typer, level + 1);
+                let (args, body) = expr_typer.do_infer_fn(args, body, &return_annotation)?;
                 let args_types = args.iter().map(|a| a.typ.clone()).collect();
                 let typ = fn_(args_types, body.typ());
 
@@ -2165,14 +2165,14 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
     }
 }
 
-struct FnTyper<'a, 'b, 'c> {
+struct ExprTyper<'a, 'b, 'c> {
     typer: &'a mut ModuleTyper<'b, 'c>,
     level: usize,
 }
 
-impl<'a, 'b, 'c> FnTyper<'a, 'b, 'c> {
+impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
     pub fn new(typer: &'a mut ModuleTyper<'b, 'c>, level: usize) -> Self {
-        Self { typer, level }
+        ExprTyper { typer, level }
     }
 
     /// Crawl the AST, annotating each node with the inferred type or
@@ -2402,8 +2402,8 @@ impl<'a, 'b, 'c> FnTyper<'a, 'b, 'c> {
         level: usize,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
-        let mut fn_typer = FnTyper::new(self.typer, level);
-        let (args, body) = fn_typer.do_infer_fn(args, body, &return_annotation)?;
+        let mut expr_typer = ExprTyper::new(self.typer, level);
+        let (args, body) = expr_typer.do_infer_fn(args, body, &return_annotation)?;
         let args_types = args.iter().map(|a| a.typ.clone()).collect();
         let typ = fn_(args_types, body.typ());
         Ok(TypedExpr::Fn {
