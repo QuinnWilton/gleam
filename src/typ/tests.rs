@@ -194,7 +194,7 @@ fn infer_test() {
                 .parse($src)
                 .expect("syntax error");
             let importable_modules = HashMap::new();
-            let mut typer = Typer::new(&[], &importable_modules);
+            let mut typer = ModuleTyper::new(&[], &importable_modules);
             let result = typer.infer(ast, 1).expect("should successfully infer");
             assert_eq!(
                 ($src, printer.pretty_print(result.typ().as_ref(), 0),),
@@ -423,7 +423,7 @@ fn infer_error_test() {
                 .parse($src)
                 .expect("syntax error");
             let importable_modules = HashMap::new();
-            let mut typer = Typer::new(&[], &importable_modules);
+            let mut typer = ModuleTyper::new(&[], &importable_modules);
             let result = typer.infer(ast, 1).expect_err("should infer an error");
             assert_eq!(($src, sort_options($error)), ($src, sort_options(result)));
         };
@@ -2202,7 +2202,7 @@ fn env_types_with(things: &[&str]) -> Vec<String> {
 }
 
 fn env_types() -> Vec<String> {
-    Typer::new(&[], &HashMap::new())
+    ModuleTyper::new(&[], &HashMap::new())
         .module_types
         .keys()
         .map(|s| s.to_string())
@@ -2218,7 +2218,7 @@ fn env_vars_with(things: &[&str]) -> Vec<String> {
 }
 
 fn env_vars() -> Vec<String> {
-    Typer::new(&[], &HashMap::new())
+    ModuleTyper::new(&[], &HashMap::new())
         .local_values
         .keys()
         .map(|s| s.to_string())

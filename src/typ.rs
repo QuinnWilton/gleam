@@ -68,7 +68,7 @@ impl Type {
         module: &[String],
         name: &str,
         arity: usize,
-        typer: &mut Typer,
+        typer: &mut ModuleTyper,
     ) -> Option<Vec<Arc<Type>>> {
         match self {
             Type::App {
@@ -314,7 +314,7 @@ pub enum PatternConstructor {
 }
 
 #[derive(Debug, Clone)]
-pub struct Typer<'a, 'b> {
+pub struct ModuleTyper<'a, 'b> {
     current_module: &'b [String],
     uid: usize,
     annotated_generic_types: im::HashSet<usize>,
@@ -337,12 +337,12 @@ pub struct Typer<'a, 'b> {
     warnings: Vec<Warning>,
 }
 
-impl<'a, 'b> Typer<'a, 'b> {
+impl<'a, 'b> ModuleTyper<'a, 'b> {
     pub fn new(
         current_module: &'b [String],
         importable_modules: &'a HashMap<String, Module>,
     ) -> Self {
-        let mut typer = Typer {
+        let mut typer = ModuleTyper {
             uid: 0,
             annotated_generic_types: im::HashSet::new(),
             module_types: HashMap::new(),
@@ -2510,7 +2510,7 @@ pub fn infer_module(
     module: UntypedModule,
     modules: &HashMap<String, Module>,
 ) -> (Result<TypedModule, Error>, Vec<Warning>) {
-    let mut typer = Typer::new(module.name.as_slice(), modules);
+    let mut typer = ModuleTyper::new(module.name.as_slice(), modules);
     let module_name = &module.name;
 
     for s in module.statements.iter() {
@@ -2968,7 +2968,7 @@ pub fn infer_module(
         }
     }
 
-    let Typer {
+    let ModuleTyper {
         module_types: types,
         module_values: values,
         accessors,
@@ -2993,7 +2993,7 @@ pub fn infer_module(
 }
 
 struct PatternTyper<'a, 'b, 'c> {
-    typer: &'a mut Typer<'b, 'c>,
+    typer: &'a mut ModuleTyper<'b, 'c>,
     level: usize,
     mode: PatternMode,
     initial_pattern_vars: HashSet<String>,
@@ -3005,7 +3005,7 @@ enum PatternMode {
 }
 
 impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
-    pub fn new(typer: &'a mut Typer<'b, 'c>, level: usize) -> Self {
+    pub fn new(typer: &'a mut ModuleTyper<'b, 'c>, level: usize) -> Self {
         Self {
             typer,
             level,
@@ -3344,12 +3344,12 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
 }
 
 struct FnTyper<'a, 'b, 'c> {
-    typer: &'a mut Typer<'b, 'c>,
+    typer: &'a mut ModuleTyper<'b, 'c>,
     level: usize,
 }
 
 impl<'a, 'b, 'c> FnTyper<'a, 'b, 'c> {
-    pub fn new(typer: &'a mut Typer<'b, 'c>, level: usize) -> Self {
+    pub fn new(typer: &'a mut ModuleTyper<'b, 'c>, level: usize) -> Self {
         Self { typer, level }
     }
 
@@ -3419,7 +3419,7 @@ fn assert_no_labelled_arguments<A>(args: &[CallArg<A>]) -> Result<(), Error> {
 
 fn get_field_map<'a>(
     constructor: &TypedExpr,
-    typer: &'a Typer,
+    typer: &'a ModuleTyper,
 ) -> Result<Option<&'a FieldMap>, GetValueConstructorError> {
     let (module, name) = match constructor {
         TypedExpr::ModuleSelect {
@@ -3493,7 +3493,7 @@ fn unify_enclosed_type(
         _ => result,
     }
 }
-fn unify(t1: Arc<Type>, t2: Arc<Type>, typer: &Typer) -> Result<(), UnifyError> {
+fn unify(t1: Arc<Type>, t2: Arc<Type>, typer: &ModuleTyper) -> Result<(), UnifyError> {
     if t1 == t2 {
         return Ok(());
     }
