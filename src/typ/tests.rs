@@ -195,7 +195,8 @@ fn infer_test() {
                 .expect("syntax error");
             let importable_modules = HashMap::new();
             let mut typer = ModuleTyper::new(&[], &importable_modules);
-            let mut expr_typer = ExprTyper::new(&mut typer, 1);
+            let expr_local_values = typer.local_values.clone();
+            let mut expr_typer = ExprTyper::new(&mut typer, 1, expr_local_values);
             let result = expr_typer.infer(ast).expect("should successfully infer");
             assert_eq!(
                 ($src, printer.pretty_print(result.typ().as_ref(), 0),),
@@ -425,7 +426,8 @@ fn infer_error_test() {
                 .expect("syntax error");
             let importable_modules = HashMap::new();
             let mut typer = ModuleTyper::new(&[], &importable_modules);
-            let mut expr_typer = ExprTyper::new(&mut typer, 1);
+            let expr_local_values = typer.local_values.clone();
+            let mut expr_typer = ExprTyper::new(&mut typer, 1, expr_local_values);
             let result = expr_typer.infer(ast).expect_err("should infer an error");
             assert_eq!(($src, sort_options($error)), ($src, sort_options(result)));
         };

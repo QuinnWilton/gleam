@@ -321,7 +321,7 @@ pub struct ModuleTyper<'a, 'b> {
     importable_modules: &'a HashMap<String, Module>,
     imported_modules: HashMap<String, Module>,
 
-    // Values defined in the current function (or the prelude)
+    // Values defined in the prelude
     local_values: im::HashMap<String, ValueConstructor>,
 
     // Types defined in the current module (or the prelude)
@@ -568,12 +568,6 @@ impl<'a, 'b> ModuleTyper<'a, 'b> {
         }
     }
 
-    /// Lookup a variable in the current scope.
-    ///
-    pub fn get_variable(&self, name: &str) -> Option<&ValueConstructor> {
-        self.local_values.get(name)
-    }
-
     /// Map a type in the current scope.
     /// Errors if the module already has a type with that name, unless the type is from the
     /// prelude.
@@ -636,43 +630,6 @@ impl<'a, 'b> ModuleTyper<'a, 'b> {
                         module_name: module.name.clone(),
                         type_constructors: module.types.keys().map(|t| t.to_string()).collect(),
                     })
-            }
-        }
-    }
-
-    /// Lookup a value constructor in the current scope.
-    ///
-    fn get_value_constructor(
-        &self,
-        module: Option<&String>,
-        name: &str,
-    ) -> Result<&ValueConstructor, GetValueConstructorError> {
-        match module {
-            None => self.local_values.get(name).ok_or_else(|| {
-                GetValueConstructorError::UnknownVariable {
-                    name: name.to_string(),
-                    variables: self.local_values.keys().map(|t| t.to_string()).collect(),
-                }
-            }),
-
-            Some(module) => {
-                let module = self.imported_modules.get(&*module).ok_or_else(|| {
-                    GetValueConstructorError::UnknownModule {
-                        name: name.to_string(),
-                        imported_modules: self
-                            .importable_modules
-                            .keys()
-                            .map(|t| t.to_string())
-                            .collect(),
-                    }
-                })?;
-                module.values.get(&*name).ok_or_else(|| {
-                    GetValueConstructorError::UnknownModuleValue {
-                        name: name.to_string(),
-                        module_name: module.name.clone(),
-                        value_constructors: module.values.keys().map(|t| t.to_string()).collect(),
-                    }
-                })
             }
         }
     }
@@ -1475,8 +1432,9 @@ pub fn infer_module(
                 );
 
                 // Infer the type
-                let mut expr_typer = ExprTyper::new(&mut typer, level + 1);
-                let (args, body) = expr_typer.do_infer_fn(args, body, &return_annotation)?;
+                let expr_local_values = typer.local_values.clone();
+                let (args, body) = ExprTyper::new(&mut typer, level + 1, expr_local_values)
+                    .do_infer_fn(args, body, &return_annotation)?;
                 let args_types = args.iter().map(|a| a.typ.clone()).collect();
                 let typ = fn_(args_types, body.typ());
 
@@ -1818,8 +1776,8 @@ pub fn infer_module(
     )
 }
 
-struct PatternTyper<'a, 'b, 'c> {
-    typer: &'a mut ModuleTyper<'b, 'c>,
+struct PatternTyper<'a, 'b, 'c, 'd> {
+    typer: &'a mut ExprTyper<'b, 'c, 'd>,
     level: usize,
     mode: PatternMode,
     initial_pattern_vars: HashSet<String>,
@@ -1830,8 +1788,8 @@ enum PatternMode {
     Alternative,
 }
 
-impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
-    pub fn new(typer: &'a mut ModuleTyper<'b, 'c>, level: usize) -> Self {
+impl<'a, 'b, 'c, 'd> PatternTyper<'a, 'b, 'c, 'd> {
+    pub fn new(typer: &'a mut ExprTyper<'b, 'c, 'd>, level: usize) -> Self {
         Self {
             typer,
             level,
@@ -1942,7 +1900,7 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
             }
 
             Pattern::Nil { location } => {
-                unify(typ, list(self.typer.new_unbound_var(self.level)))
+                unify(typ, list(self.typer.typer.new_unbound_var(self.level)))
                     .map_err(|e| convert_unify_error(e, &location))?;
                 Ok(Pattern::Nil { location })
             }
@@ -1952,13 +1910,14 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
                 head,
                 tail,
                 deprecated_syntax,
-            } => match typ.get_app_args(true, &[], "List", 1, self.typer) {
+            } => match typ.get_app_args(true, &[], "List", 1, self.typer.typer) {
                 Some(args) => {
                     let head = Box::new(self.unify(*head, args[0].clone())?);
                     let tail = Box::new(self.unify(*tail, typ)?);
 
                     if deprecated_syntax {
                         self.typer
+                            .typer
                             .warnings
                             .push(Warning::DeprecatedListPrependSyntax {
                                 location: SrcSpan {
@@ -1977,7 +1936,7 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
                 }
 
                 None => Err(Error::CouldNotUnify {
-                    given: list(self.typer.new_unbound_var(self.level)),
+                    given: list(self.typer.typer.new_unbound_var(self.level)),
                     expected: typ.clone(),
                     location,
                 }),
@@ -1995,7 +1954,7 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
 
                 Type::Var { .. } => {
                     let elems_types = (0..(elems.len()))
-                        .map(|_| self.typer.new_unbound_var(self.level))
+                        .map(|_| self.typer.typer.new_unbound_var(self.level))
                         .collect();
                     unify(tuple(elems_types), typ.clone())
                         .map_err(|e| convert_unify_error(e, &location))?;
@@ -2004,7 +1963,7 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
 
                 _ => {
                     let elems_types = (0..(elems.len()))
-                        .map(|_| self.typer.new_unbound_var(self.level))
+                        .map(|_| self.typer.typer.new_unbound_var(self.level))
                         .collect();
 
                     Err(Error::CouldNotUnify {
@@ -2095,6 +2054,7 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
 
                 let instantiated_constructor_type =
                     self.typer
+                        .typer
                         .instantiate(constructor_typ, self.level, &mut hashmap![]);
                 match &*instantiated_constructor_type {
                     Type::Fn { args, retrn } => {
@@ -2168,11 +2128,83 @@ impl<'a, 'b, 'c> PatternTyper<'a, 'b, 'c> {
 struct ExprTyper<'a, 'b, 'c> {
     typer: &'a mut ModuleTyper<'b, 'c>,
     level: usize,
+    local_values: im::HashMap<String, ValueConstructor>,
 }
 
 impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
-    pub fn new(typer: &'a mut ModuleTyper<'b, 'c>, level: usize) -> Self {
-        ExprTyper { typer, level }
+    pub fn new(
+        typer: &'a mut ModuleTyper<'b, 'c>,
+        level: usize,
+        local_values: im::HashMap<String, ValueConstructor>,
+    ) -> Self {
+        ExprTyper {
+            typer,
+            level,
+            local_values,
+        }
+    }
+
+    /// Insert a variable in the current scope.
+    ///
+    pub fn insert_variable(
+        &mut self,
+        name: String,
+        variant: ValueConstructorVariant,
+        typ: Arc<Type>,
+    ) {
+        self.local_values.insert(
+            name,
+            ValueConstructor {
+                public: false,
+                origin: Default::default(), // TODO: use the real one
+                variant,
+                typ,
+            },
+        );
+    }
+
+    /// Lookup a variable in the current scope.
+    ///
+    pub fn get_variable(&self, name: &str) -> Option<&ValueConstructor> {
+        self.local_values.get(name)
+    }
+
+    /// Lookup a value constructor in the current scope.
+    ///
+    fn get_value_constructor(
+        &self,
+        module: Option<&String>,
+        name: &str,
+    ) -> Result<&ValueConstructor, GetValueConstructorError> {
+        match module {
+            None => self.local_values.get(name).ok_or_else(|| {
+                GetValueConstructorError::UnknownVariable {
+                    name: name.to_string(),
+                    variables: self.local_values.keys().map(|t| t.to_string()).collect(),
+                }
+            }),
+
+            Some(module) => {
+                let module = self.typer.imported_modules.get(&*module).ok_or_else(|| {
+                    GetValueConstructorError::UnknownModule {
+                        name: name.to_string(),
+                        imported_modules: self
+                            .typer
+                            .importable_modules
+                            .keys()
+                            .map(|t| t.to_string())
+                            .collect(),
+                    }
+                })?;
+                module.values.get(&*name).ok_or_else(|| {
+                    GetValueConstructorError::UnknownModuleValue {
+                        name: name.to_string(),
+                        module_name: module.name.clone(),
+                        value_constructors: module.values.keys().map(|t| t.to_string()).collect(),
+                    }
+                })
+            }
+        }
     }
 
     /// Crawl the AST, annotating each node with the inferred type or
@@ -2295,19 +2327,17 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         for (id, _type) in type_vars.values() {
             self.typer.annotated_generic_types.insert(*id);
         }
+        let mut body_typer = ExprTyper::new(self.typer, self.level, self.local_values.clone());
 
         // Insert arguments into function body scope.
-        let previous_vars = self.typer.local_values.clone();
         for (arg, t) in args.iter().zip(args.iter().map(|arg| arg.typ.clone())) {
             match &arg.names {
-                ArgNames::Named { name } | ArgNames::NamedLabelled { name, .. } => self
-                    .typer
+                ArgNames::Named { name } | ArgNames::NamedLabelled { name, .. } => body_typer
                     .insert_variable(name.to_string(), ValueConstructorVariant::LocalVariable, t),
                 ArgNames::Discard { .. } | ArgNames::LabelledDiscard { .. } => (),
             };
         }
-
-        let body = self.infer(body)?;
+        let body = body_typer.infer(body)?;
 
         // Check that any return type annotation is accurate.
         if let Some(ann) = return_annotation {
@@ -2318,7 +2348,6 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         }
 
         // Reset the typer now that the scope of the function has ended.
-        self.typer.local_values = previous_vars;
         self.typer.annotated_generic_types = previous_annotated_generic_types;
         Ok((args, body))
     }
@@ -2396,8 +2425,8 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         return_annotation: Option<TypeAst>,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
-        let mut expr_typer = ExprTyper::new(self.typer, self.level);
-        let (args, body) = expr_typer.do_infer_fn(args, body, &return_annotation)?;
+        let (args, body) = ExprTyper::new(self.typer, self.level, self.local_values.clone())
+            .do_infer_fn(args, body, &return_annotation)?;
         let args_types = args.iter().map(|a| a.typ.clone()).collect();
         let typ = fn_(args_types, body.typ());
         Ok(TypedExpr::Fn {
@@ -2576,8 +2605,8 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         annotation: &Option<TypeAst>,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
-        let mut val_typer = ExprTyper::new(self.typer, self.level + 1);
-        let value = val_typer.infer(value)?;
+        let value =
+            ExprTyper::new(self.typer, self.level + 1, self.local_values.clone()).infer(value)?;
         let try_value_type = self.typer.new_unbound_var(self.level);
         let try_error_type = self.typer.new_unbound_var(self.level);
 
@@ -2596,8 +2625,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         let value_typ = generalise(value_typ, self.level + 1);
 
         // Ensure the pattern matches the type of the value
-        let pattern =
-            PatternTyper::new(self.typer, self.level).unify(pattern, value_typ.clone())?;
+        let pattern = PatternTyper::new(self, self.level).unify(pattern, value_typ.clone())?;
 
         // Check the type of the following code
         let then = self.infer(then)?;
@@ -2643,8 +2671,8 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         let return_type = self.typer.new_unbound_var(self.level);
 
         for subject in subjects.into_iter() {
-            let mut subject_typer = ExprTyper::new(self.typer, self.level + 1);
-            let subject = subject_typer.infer(subject)?;
+            let subject = ExprTyper::new(self.typer, self.level + 1, self.local_values.clone())
+                .infer(subject)?;
             let subject_type = generalise(subject.typ(), self.level + 1);
             typed_subjects.push(subject);
             subject_types.push(subject_type);
@@ -2677,17 +2705,17 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
             location,
         } = clause;
 
-        // Store the local scope so it can be reset after the clause
-        let vars = self.typer.local_values.clone();
-
+        // Create a new scope for the clause
+        let mut clause_typer = ExprTyper::new(self.typer, self.level, self.local_values.clone());
         // Check the types
-        let (typed_pattern, typed_alternatives) =
-            self.infer_clause_pattern(pattern, alternative_patterns, subjects, &location)?;
-        let guard = self.infer_optional_clause_guard(guard)?;
-        let then = self.infer(then)?;
-
-        // Reset the local vars now the clause scope is done
-        self.typer.local_values = vars;
+        let (typed_pattern, typed_alternatives) = clause_typer.infer_clause_pattern(
+            pattern,
+            alternative_patterns,
+            subjects,
+            &location,
+        )?;
+        let guard = clause_typer.infer_optional_clause_guard(guard)?;
+        let then = clause_typer.infer(then)?;
 
         Ok(Clause {
             location,
@@ -2705,7 +2733,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         subjects: &[Arc<Type>],
         location: &SrcSpan,
     ) -> Result<(TypedMultiPattern, Vec<TypedMultiPattern>), Error> {
-        let mut pattern_typer = PatternTyper::new(self.typer, self.level);
+        let mut pattern_typer = PatternTyper::new(self, self.level);
         let typed_pattern = pattern_typer.infer_multi_pattern(pattern, subjects, &location)?;
 
         // Each case clause has one or more patterns that may match the
@@ -3135,7 +3163,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         mut args: Vec<CallArg<UntypedExpr>>,
         location: &SrcSpan,
     ) -> Result<(TypedExpr, Vec<TypedCallArg>, Arc<Type>), Error> {
-        match get_field_map(&fun, self.typer)
+        match get_field_map(&fun, self)
             .map_err(|e| convert_get_value_constructor_error(e, location))?
         {
             // The fun has a field map so labelled arguments may be present and need to be reordered.
@@ -3186,18 +3214,12 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
             origin,
             typ,
         } = self
-            .typer
             .get_variable(name)
             .cloned()
             .ok_or_else(|| Error::UnknownVariable {
                 location: location.clone(),
                 name: name.to_string(),
-                variables: self
-                    .typer
-                    .local_values
-                    .keys()
-                    .map(|t| t.to_string())
-                    .collect(),
+                variables: self.local_values.keys().map(|t| t.to_string()).collect(),
             })?;
         let typ = self.typer.instantiate(typ, self.level, &mut hashmap![]);
         Ok(ValueConstructor {
@@ -3250,9 +3272,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         access_location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
         match container {
-            UntypedExpr::Var { name, location, .. }
-                if !self.typer.local_values.contains_key(&name) =>
-            {
+            UntypedExpr::Var { name, location, .. } if !self.local_values.contains_key(&name) => {
                 self.infer_module_access(name.as_ref(), label, &location, access_location)
             }
 
@@ -3383,7 +3403,7 @@ fn assert_no_labelled_arguments<A>(args: &[CallArg<A>]) -> Result<(), Error> {
 
 fn get_field_map<'a>(
     constructor: &TypedExpr,
-    typer: &'a ModuleTyper,
+    typer: &'a ExprTyper,
 ) -> Result<Option<&'a FieldMap>, GetValueConstructorError> {
     let (module, name) = match constructor {
         TypedExpr::ModuleSelect {
