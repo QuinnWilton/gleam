@@ -1433,8 +1433,9 @@ pub fn infer_module(
 
                 // Infer the type
                 let expr_local_values = typer.local_values.clone();
-                let (args, body) = ExprTyper::new(&mut typer, level + 1, expr_local_values)
-                    .do_infer_fn(args, body, &return_annotation)?;
+                let (args, body) =
+                    ExprTyper::new(&mut typer, level + 1, expr_local_values, hashmap![])
+                        .do_infer_fn(args, body, &return_annotation)?;
                 let args_types = args.iter().map(|a| a.typ.clone()).collect();
                 let typ = fn_(args_types, body.typ());
 
@@ -2129,6 +2130,7 @@ struct ExprTyper<'a, 'b, 'c> {
     typer: &'a mut ModuleTyper<'b, 'c>,
     level: usize,
     local_values: im::HashMap<String, ValueConstructor>,
+    type_vars: im::HashMap<String, (usize, Arc<Type>)>,
 }
 
 impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
@@ -2136,11 +2138,13 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         typer: &'a mut ModuleTyper<'b, 'c>,
         level: usize,
         local_values: im::HashMap<String, ValueConstructor>,
+        type_vars: im::HashMap<String, (usize, Arc<Type>)>,
     ) -> Self {
         ExprTyper {
             typer,
             level,
             local_values,
+            type_vars,
         }
     }
 
@@ -2315,19 +2319,23 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
     ) -> Result<(Vec<TypedArg>, TypedExpr), Error> {
         // Construct an initial type for each argument of the function- either an unbound type variable
         // or a type provided by an annotation.
-        let mut type_vars = hashmap![];
         let args: Vec<_> = args
             .into_iter()
-            .map(|arg| self.infer_arg(arg, &mut type_vars))
+            .map(|arg| self.infer_arg(arg))
             .collect::<Result<_, _>>()?;
 
         // Record generic type variables that comes from type annotations.
         // They cannot be instantiated so we need to keep track of them.
         let previous_annotated_generic_types = self.typer.annotated_generic_types.clone();
-        for (id, _type) in type_vars.values() {
+        for (id, _type) in self.type_vars.values() {
             self.typer.annotated_generic_types.insert(*id);
         }
-        let mut body_typer = ExprTyper::new(self.typer, self.level, self.local_values.clone());
+        let mut body_typer = ExprTyper::new(
+            self.typer,
+            self.level,
+            self.local_values.clone(),
+            self.type_vars.clone(),
+        );
 
         // Insert arguments into function body scope.
         for (arg, t) in args.iter().zip(args.iter().map(|arg| arg.typ.clone())) {
@@ -2343,7 +2351,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         if let Some(ann) = return_annotation {
             let ret_typ =
                 self.typer
-                    .type_from_ast(ann, &mut type_vars, NewTypeAction::MakeGeneric)?;
+                    .type_from_ast(ann, &mut self.type_vars, NewTypeAction::MakeGeneric)?;
             unify(ret_typ, body.typ()).map_err(|e| convert_unify_error(e, body.location()))?;
         }
 
@@ -2425,8 +2433,13 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         return_annotation: Option<TypeAst>,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
-        let (args, body) = ExprTyper::new(self.typer, self.level, self.local_values.clone())
-            .do_infer_fn(args, body, &return_annotation)?;
+        let (args, body) = ExprTyper::new(
+            self.typer,
+            self.level,
+            self.local_values.clone(),
+            self.type_vars.clone(),
+        )
+        .do_infer_fn(args, body, &return_annotation)?;
         let args_types = args.iter().map(|a| a.typ.clone()).collect();
         let typ = fn_(args_types, body.typ());
         Ok(TypedExpr::Fn {
@@ -2605,8 +2618,13 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         annotation: &Option<TypeAst>,
         location: SrcSpan,
     ) -> Result<TypedExpr, Error> {
-        let value =
-            ExprTyper::new(self.typer, self.level + 1, self.local_values.clone()).infer(value)?;
+        let value = ExprTyper::new(
+            self.typer,
+            self.level + 1,
+            self.local_values.clone(),
+            self.type_vars.clone(),
+        )
+        .infer(value)?;
         let try_value_type = self.typer.new_unbound_var(self.level);
         let try_error_type = self.typer.new_unbound_var(self.level);
 
@@ -2642,7 +2660,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         if let Some(ann) = annotation {
             let ann_typ = self
                 .typer
-                .type_from_ast(ann, &mut hashmap![], NewTypeAction::MakeGeneric)
+                .type_from_ast(ann, &mut self.type_vars, NewTypeAction::MakeGeneric)
                 .map(|t| self.typer.instantiate(t, self.level, &mut hashmap![]))?;
             unify(ann_typ, value_typ).map_err(|e| convert_unify_error(e, value.location()))?;
         }
@@ -2671,8 +2689,13 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         let return_type = self.typer.new_unbound_var(self.level);
 
         for subject in subjects.into_iter() {
-            let subject = ExprTyper::new(self.typer, self.level + 1, self.local_values.clone())
-                .infer(subject)?;
+            let subject = ExprTyper::new(
+                self.typer,
+                self.level + 1,
+                self.local_values.clone(),
+                self.type_vars.clone(),
+            )
+            .infer(subject)?;
             let subject_type = generalise(subject.typ(), self.level + 1);
             typed_subjects.push(subject);
             subject_types.push(subject_type);
@@ -2706,7 +2729,12 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         } = clause;
 
         // Create a new scope for the clause
-        let mut clause_typer = ExprTyper::new(self.typer, self.level, self.local_values.clone());
+        let mut clause_typer = ExprTyper::new(
+            self.typer,
+            self.level,
+            self.local_values.clone(),
+            self.type_vars.clone(),
+        );
         // Check the types
         let (typed_pattern, typed_alternatives) = clause_typer.infer_clause_pattern(
             pattern,
@@ -3230,11 +3258,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
         })
     }
 
-    fn infer_arg(
-        &mut self,
-        arg: UntypedArg,
-        type_vars: &mut im::HashMap<String, (usize, Arc<Type>)>,
-    ) -> Result<TypedArg, Error> {
+    fn infer_arg(&mut self, arg: UntypedArg) -> Result<TypedArg, Error> {
         let Arg {
             names,
             annotation,
@@ -3245,7 +3269,7 @@ impl<'a, 'b, 'c> ExprTyper<'a, 'b, 'c> {
             .clone()
             .map(|t| {
                 self.typer
-                    .type_from_ast(&t, type_vars, NewTypeAction::MakeGeneric)
+                    .type_from_ast(&t, &mut self.type_vars, NewTypeAction::MakeGeneric)
             })
             .unwrap_or_else(|| Ok(self.typer.new_unbound_var(self.level)))?;
         Ok(Arg {

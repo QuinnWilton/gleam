@@ -196,7 +196,7 @@ fn infer_test() {
             let importable_modules = HashMap::new();
             let mut typer = ModuleTyper::new(&[], &importable_modules);
             let expr_local_values = typer.local_values.clone();
-            let mut expr_typer = ExprTyper::new(&mut typer, 1, expr_local_values);
+            let mut expr_typer = ExprTyper::new(&mut typer, 1, expr_local_values, hashmap![]);
             let result = expr_typer.infer(ast).expect("should successfully infer");
             assert_eq!(
                 ($src, printer.pretty_print(result.typ().as_ref(), 0),),
@@ -427,7 +427,7 @@ fn infer_error_test() {
             let importable_modules = HashMap::new();
             let mut typer = ModuleTyper::new(&[], &importable_modules);
             let expr_local_values = typer.local_values.clone();
-            let mut expr_typer = ExprTyper::new(&mut typer, 1, expr_local_values);
+            let mut expr_typer = ExprTyper::new(&mut typer, 1, expr_local_values, hashmap![]);
             let result = expr_typer.infer(ast).expect_err("should infer an error");
             assert_eq!(($src, sort_options($error)), ($src, sort_options(result)));
         };
@@ -1567,6 +1567,39 @@ pub opaque type One { One(name: String) }
 pub fn get(x: One) { x.name }",
         vec![("get", "fn(One) -> String"),]
     );
+
+    // Type variables are shared between function annotations and function annotations within their body
+    assert_infer!(
+        "
+        pub type Box(a) {
+            Box(value: a)
+        };
+
+        pub fn go(box1: Box(a)) {
+            fn(box2: Box(a)) { box1.value == box2.value }
+        }",
+        vec![
+            ("Box", "fn(a) -> Box(a)"),
+            ("go", "fn(Box(a)) -> fn(Box(a)) -> Bool")
+        ]
+    );
+
+    // Type variables are shared between function annotations and let annotations within their body
+    assert_infer!(
+        "
+        pub type Box(a) {
+            Box(value: a)
+        };
+
+        pub fn go(box1: Box(a)) {
+            let x: Box(a) = box1
+            fn(box2: Box(a)) { x.value == box2.value }
+        }",
+        vec![
+            ("Box", "fn(a) -> Box(a)"),
+            ("go", "fn(Box(a)) -> fn(Box(a)) -> Bool")
+        ]
+    );
 }
 
 #[test]
@@ -2118,6 +2151,42 @@ fn main() {
     // Cases were we can't so easily check for equality-
     // i.e. because the contents of the error are non-deterministic.
     assert_error!("fn inc(x: a) { x + 1 }");
+
+    // Type variables are shared between function annotations and let annotations within their body
+    assert_error!(
+        "
+        pub type Box(a) {
+            Box(value: a)
+        }
+
+        pub fn go(box1: Box(a), box2: Box(b)) {
+            let _: Box(a) = box2
+            let _: Box(b) = box1
+            5
+        }",
+        Error::CouldNotUnify {
+            location: SrcSpan {
+                start: 173,
+                end: 177
+            },
+            expected: Arc::new(Type::App {
+                public: true,
+                module: vec!["my_module".to_string()],
+                name: "Box".to_string(),
+                args: vec![Arc::new(Type::Var {
+                    typ: Arc::new(RefCell::new(TypeVar::Generic { id: 11 })),
+                })]
+            }),
+            given: Arc::new(Type::App {
+                public: true,
+                module: vec!["my_module".to_string()],
+                name: "Box".to_string(),
+                args: vec![Arc::new(Type::Var {
+                    typ: Arc::new(RefCell::new(TypeVar::Generic { id: 9 })),
+                })]
+            }),
+        },
+    );
 }
 
 #[test]
